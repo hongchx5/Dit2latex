@@ -1,0 +1,361 @@
+# 代码构建规范：DiTtolatex
+
+## 项目概述
+
+基于风格条件 Diffusion Transformer (DiT-B/2) 的手写数学公式图像生成。
+输入打印体公式图像 I_p（内容结构）和手写风格参考图像 I_s（笔迹风格），
+输出风格迁移后的手写公式图像 I_g。
+
+---
+
+## 一、数据流架构
+
+```
+I_p (print) ──→ VAE Enc ──→ z_p ──┐
+                                   ├──→ 通道拼接 z_t' = [z_t; z_p]
+z_0 (target handwrite) ──→ VAE Enc ──→ z_0 ──→ q(zt|z0) ──→ z_t ──┘
+                                                                  │
+I_s (style ref) ──→ CLIP Enc ──→ f_s ────────────────────────────┤
+                                                                  │
+z_t' ──→ DiT Block × 12 ──→ ε̂ ──→ MSE(z_t, z_0, ε)
+              ↑        ↑
+        AdaLN-Zero   Cross-Attn
+        (z_t', f_s)  (Q=z_t', K/V=f_s)
+```
+
+### 一句话总结数据流
+
+`z_t' = [VAE(z_t); VAE(I_p)]` 与 `f_s = CLIP(I_s)` 在 DiT Block 内通过
+AdaLN-Zero 调制 + Cross-Attention 交互，预测噪声 ε̂。
+
+---
+
+## 二、目录结构
+
+```
+DiTtolatex/
+├── config/
+│   ├── default.yaml            # 所有超参数集中管理
+│   └── config_loader.py        # 加载 YAML，提供 dataclass
+├── data/
+│   ├── dataset.py              # 训练 Dataset（实现采样策略）
+│   └── transforms.py           # 等比例缩放 + 白色填充到 256×256
+├── models/
+│   ├── vae.py                  # VAE: 正常模式 SD VAE / offline 模式 简单采样+线性
+│   ├── style_encoder.py        # 风格编码器: 正常模式 CLIP / offline 模式 CNN+FC
+│   ├── dit/
+│   │   ├── dit_block.py        # 单个 DiT Block
+│   │   ├── attention.py        # Multi-head Self/Cross Attention
+│   │   ├── adaln.py            # AdaLN-Zero 调制模块
+│   │   ├── patch_embed.py      # Patch embedding + sin-cos 位置编码
+│   │   └── dit.py              # 完整 DiT：输入 z_t', f_s, t → 输出 ε̂
+│   └── pipeline.py             # 训练/推理通用的前向管线
+├── diffusion/
+│   ├── noise_schedule.py       # 余弦 β 调度 + 扩散工具函数
+│   └── ddim.py                 # DDIM 采样器
+├── losses/
+│   ├── diffusion_loss.py       # 噪声预测 MSE
+│   └── perceptual_loss.py      # VGG feature matching loss
+├── train/
+│   ├── trainer.py              # 训练循环
+│   ├── optimizer.py            # AdamW + warmup + 余弦衰减
+│   └── checkpoint.py           # 保存/恢复/EMA
+├── inference/
+│   └── inferencer.py           # DDIM 推理 + CFG
+├── eval/
+│   ├── fid_lpips.py            # FID / LPIPS
+│   └── style_metrics.py        # 风格检索 / Gram matrix
+├── scripts/
+│   ├── train.sh
+│   └── infer.sh
+├── main.py                     # CLI: train / infer / eval
+├── requirements.txt
+└── 代码构建.prompt             # 本文件
+```
+
+---
+
+## 三、数据预处理
+
+### 3.1 图像缩放与填充
+
+```
+def preprocess(image: PIL.Image) -> PIL.Image:
+    1. 等比例缩放：将长边缩放到 256，短边按比例
+    2. 白色填充：将缩放后的图像居中放置在 256×256 白色画布上
+    3. 转为 RGB
+```
+
+### 3.2 数据目录结构
+
+```
+data/
+├── print/          # 打印体公式图像
+│   ├── img1.png
+│   ├── img2.png
+│   └── ...
+├── style1/         # 手写风格 1
+│   ├── img1.png    # 与 print/ 同名
+│   ├── img2.png
+│   └── ...
+├── style2/         # 手写风格 2
+│   ├── img1.png
+│   └── ...
+└── ...
+```
+
+### 3.3 训练数据采样策略 (核心)
+
+每个 step 产生 9 条训练数据：
+
+```
+for img_i in print_dir:            # 遍历每张打印体图片
+    for _ in range(3):             # 重复 3 轮
+        随机选择一种风格 style_k
+        从 style_k 中随机选 3 张 ≠ img_i 的图片作为 I_s
+        => 得到 3 条数据: (I_p=print/img_i,  I_t=style_k/img_i,  I_s=style_k/other)
+```
+
+- I_p：打印体（内容条件）
+- I_t：与 I_p 同名的目标手写图像（ground truth latent z_0 的来源）
+- I_s：同风格不同内容的 3 张图片（风格参考）
+- 每条数据是三元组 (I_p, I_s, I_t)
+- 一个 step = 9 条，以图片遍历步数控制训练总步数
+
+### 3.4 数据增强
+
+暂不启用。
+
+---
+
+## 四、模型架构细节
+
+### 4.1 VAE (models/vae.py)
+
+**正常模式：**
+- 加载 Stable Diffusion VAE（f=8, latent_dim=4）
+- 冻结参数，仅用于 encode/decode
+- encode: (B,3,256,256) → (B,4,32,32)
+- decode: (B,4,32,32) → (B,3,256,256)
+
+**Offline 测试模式：**
+- Encoder: AvgPool2d(kernel=8, stride=8) → Conv2d(3→4, k=1)  （保持输出维度一致）
+- Decoder: Conv2d(4→3, k=1) → Upsample(×8, nearest)
+- 模式通过配置 `offline_test: true/false` 切换
+
+### 4.2 风格编码器 (models/style_encoder.py)
+
+**正常模式：**
+- CLIP ViT-B/32 图像编码器（冻结）
+- 输出 768 维全局特征
+- MLP 投影：768 → 风格特征 dim（用于 AdaLN 和 Cross-Attn）
+
+**Offline 模式：**
+- 简单卷积下采样链：Conv→ReLU→Conv→ReLU→AdaptiveAvgPool→FC(768)
+- 输出 768 维
+
+### 4.3 DiT 骨干 (models/dit/)
+
+#### 4.3.1 入口：z_t' = [z_t; z_p]
+
+在 DiT 外部完成通道拼接：
+- z_t: (B, 4, 32, 32)  —— 噪声潜在
+- z_p: (B, 4, 32, 32)  —— 内容条件潜在
+- z_t': (B, 8, 32, 32)  —— 拼接结果
+
+Patch Embedding 将 z_t' 展平成 patch 序列。
+
+#### 4.3.2 Patch Embedding
+
+- Patch size = 2
+- 输入 (B, 8, 32, 32) → patches (B, 256, 8×2×2) = (B, 256, 32)
+- 线性投影到 hidden_dim (DiT-B: 768)
+- 添加 sin-cos 2D 位置编码
+
+#### 4.3.3 DiT Block (12 层 for DiT-B)
+
+每层执行：
+```
+1. AdaLN-Zero 调制：
+   - 时间嵌入 t_emb = sin-cos(t) → MLP
+   - 风格特征 f_s 经 MLP 映射
+   - 合并 [t_emb, f_s] → MLP → (γ1, β1, α1, γ2, β2, α2)
+   - x = modulate(LayerNorm(x), γ1, β1)
+   
+2. Multi-head Self-Attention：
+   - x = x + α1 * SelfAttn(x)
+   
+3. AdaLN-Zero 再调制：
+   - x = modulate(LayerNorm(x), γ2, β2)
+   
+4. Multi-head Cross-Attention：
+   - Q = x (z_t' 的特征)
+   - K, V = f_s (风格特征序列)
+   - x = x + α2 * CrossAttn(x, f_s)
+   
+5. MLP (SwiGLU)：
+   - x = x + MLP(x)
+```
+
+**关键参数 (DiT-B)：**
+- hidden_dim = 768
+- num_heads = 12
+- depth = 12
+- mlp_ratio = 4.0
+- patch_size = 2
+
+#### 4.3.4 输出头
+
+Final LayerNorm → Linear(hidden_dim → 8×2×2) = Linear(768, 32)
+输出 reshaped to (B, 8, 32, 32)，取前 4 通道作为预测噪声 ε̂。
+
+**为什么是 8 通道输出？**
+因为输入 z_t' 是 8 通道，噪声 ε 应当与 z_t（前 4 通道）形状一致。
+输出 8 通道，取 [:, :4, :, :] 作为最终噪声预测。
+
+---
+
+## 五、训练流程
+
+### 5.1 损失函数
+
+```
+L_total = L_diff + λ_percep * L_percep
+```
+
+- L_diff: MSE(ε̂, ε)，在 4×32×32 潜在空间
+- L_percep: VGG16 relu3_3 特征的 MSE(Î_g, I_p)，在像素空间
+  - 需要先 decode ε̂ → ẑ_0 → Î_g（可用一步近似或完整 decode）
+  - 实际实现：ε̂ → ẑ_0 → VAE.decode(ẑ_0) → VGG(Î_g, I_p)
+  - λ_percep = 0.1
+- CFG 训练：以 10% 概率 dropout 风格条件（f_s 置零）
+
+### 5.2 优化器
+
+- AdamW: lr=1e-4, weight_decay=1e-4
+- 线性 warmup: 5000 steps
+- 余弦衰减到 1e-6
+- EMA: decay=0.9999
+
+### 5.3 训练循环
+
+```
+for step in range(total_steps):
+    从 Dataset 取一个 batch (B 条三元组)
+    I_p, I_s, I_t = batch
+    
+    z_p  = VAE.encode(I_p)        # (B,4,32,32)
+    z_0  = VAE.encode(I_t)        # (B,4,32,32)
+    f_s  = CLIP.encode(I_s)       # (B,3,768) — 3张风格参考
+    
+    t ~ Uniform(0, T)
+    z_t = sqrt(ᾱ_t) * z_0 + sqrt(1-ᾱ_t) * ε
+    
+    z_t' = concat([z_t, z_p], dim=1)  # (B,8,32,32)
+    
+    ε̂ = DiT(z_t', f_s, t)
+    
+    L_diff = MSE(ε̂, ε)
+    L_percep = perceptual_loss(ε̂, z_t, ᾱ_t, I_p)  # 从 ε̂ 反推 ẑ_0 再 decode
+    L_total = L_diff + λ * L_percep
+    
+    L_total.backward()
+    optimizer.step()
+```
+
+### 5.4 验证
+
+每 N steps 在验证集上生成样本并记录图像到日志。
+
+---
+
+## 六、推理流程
+
+```
+输入: I_p (打印体), I_s (风格参考)
+输出: I_g (生成的手写公式)
+
+1. VAE.encode(I_p) → z_p
+2. CLIP.encode(I_s) → f_s
+3. z_T ~ N(0, I)  (初始噪声)
+4. DDIM 采样 50~100 步:
+   for t = T...1:
+       z_t' = concat([z_t, z_p])
+       ε̂_cond = DiT(z_t', f_s, t)
+       ε̂_uncond = DiT(z_t', 0, t)
+       ε̂ = ε̂_uncond + cfg_scale * (ε̂_cond - ε̂_uncond)
+       z_{t-1} = ddim_step(z_t, ε̂, t)
+5. VAE.decode(z_0) → I_g
+```
+
+---
+
+## 七、配置参数 (default.yaml)
+
+```yaml
+model:
+  dit:
+    type: "DiT-B/2"
+    hidden_dim: 768
+    num_heads: 12
+    depth: 12
+    mlp_ratio: 4.0
+    patch_size: 2
+  vae:
+    pretrained_path: "stabilityai/sd-vae-ft-ema"  # 或本地路径
+    latent_dim: 4
+    f: 8  # 下采样倍率
+  style_encoder:
+    model: "openai/clip-vit-base-patch32"  # 或本地路径
+    feature_dim: 768
+    num_style_images: 3  # 每次用几张风格参考图
+    style_sequence: true  # 是否转为序列（用于 Cross-Attn）
+
+training:
+  total_steps: 200000
+  batch_size: 8        # 每个 batch 的 (I_p, I_s群组, I_t) 三元组数
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 5000
+  ema_decay: 0.9999
+  cfg_dropout_rate: 0.1
+  perceptual_loss_weight: 0.1
+  val_every: 1000
+  log_every: 50
+  save_every: 5000
+
+diffusion:
+  num_timesteps: 1000
+  beta_schedule: "cosine"
+  ddim_steps: 50
+
+data:
+  data_root: "./data"
+  image_size: 256
+  epochs_per_round: 1   # 遍历 print 目录的轮数
+  repeats_per_image: 3   # 每张图重复几轮
+  styles_per_repeat: 3   # 每轮选几张风格参考图
+
+mode:
+  offline_test: false   # true 时用简单层替换预训练模块
+```
+
+---
+
+## 八、CLI 入口 (main.py)
+
+```
+python main.py train --config config/default.yaml
+python main.py infer --config config/default.yaml --print_path ... --style_path ... --output_path ...
+python main.py eval --config config/default.yaml --generated_dir ... --real_dir ...
+```
+
+---
+
+## 九、核心原则
+
+1. **模块化**：每个模型组件独立文件，通过配置组装
+2. **可离线测试**：`offline_test=true` 时所有预训练模块替换为简单层
+3. **配置驱动**：所有超参数集中在 YAML
+4. **类型标注**：关键函数和类使用 type hints
+5. **设备无关**：代码支持 CPU/CUDA 切换

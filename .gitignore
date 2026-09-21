@@ -1,0 +1,10 @@
+checkpoints/
+logs/
+data/print/
+data/style1/
+data/style2/
+pretrained/
+style_cache/
+__pycache__/
+.codewhale/
+eval_output/

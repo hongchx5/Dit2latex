@@ -1,0 +1,80 @@
+# DiTtolatex 默认配置
+# 基于风格条件 Diffusion Transformer 的手写数学公式图像生成
+
+model:
+  dit:
+    type: "DiT-B/2"
+    hidden_dim: 768
+    num_heads: 12
+    depth: 12
+    mlp_ratio: 4.0
+    patch_size: 2
+    in_channels: 8       # z_t' = [z_t; z_p] 拼接后的通道数
+    out_channels: 8      # 输出去噪后的 8 通道，取前 4 通道作为噪声预测
+    latent_dim: 4        # VAE 潜在空间通道数
+
+  vae:
+    pretrained_path: "/home/user/data3/daxger9/HMER/DiTtolatex/pretrained/stabilityai/sd-vae-ft-ema"
+    latent_dim: 4
+    f: 8                 # 下采样倍率
+
+  style_encoder:
+    model_name: "/home/user/data3/daxger9/HMER/DiTtolatex/pretrained/openai/clip-vit-base-patch32"
+    feature_dim: 768
+    num_style_images: 3  # 每次用几张风格参考图作为 I_s 组
+
+  caption:
+    enabled: true        # 是否载入 caption embed（false 则不创建 CaptionEncoder/caption cross-attn）
+    num_layers: 1        # caption TransformerEncoder 层数
+    max_len: 256         # caption 最大 token 长度
+
+training:
+  total_steps: 450000
+  batch_size: 8          # 每步的 (I_p, I_s 组, I_t) 三元组数
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 2000
+  min_lr: 1.0e-6
+  ema_decay: 0.9999
+  cfg_dropout_rate: 0.1  # CFG 训练时的风格条件丢弃概率
+  perceptual_loss_weight: 0.001
+  bucket_steps: 500      # 一个桶连续训练的步数，之后随机换桶
+  val_every: 1000
+  log_every: 50
+  save_every: 15000
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"
+  gradient_clip: 1.0
+  mixed_precision: "fp16"  # "no", "fp16", "bf16"
+
+diffusion:
+  num_timesteps: 1000
+  beta_schedule: "cosine"
+  ddim_steps: 60
+  ddim_eta: 0.0         # DDIM η 参数, 0 = 确定性
+  cfg_scale: 7.0         # classifier-free guidance 引导系数
+
+data:
+  data_root: "./data"
+  image_size: 256              # 旧版正方形边长（兼容保留，分桶模式下不使用）
+  all_size:                    # 全部桶集合 (H, W)，用于图片分类
+    - [128, 384]
+  train_size: [128, 384]      # 训练尺寸（单个，必须属于 all_size；只加载分类到该尺寸的图）
+  style_cache_dir: "./style_cache"   # 风格 tile 特征缓存目录
+  tile_size: 224               # 风格图平铺切分边长
+  tile_stride: 168             # 风格图平铺切分步长
+  caption_path: "data/caption.txt"          # latex 公式 caption 文件
+  dictionary_path: "data/dictionary.txt"    # latex 词表文件
+  repeats_per_image: 3         # 每张图重复几轮
+  styles_per_repeat: 3         # 每轮选几张风格参考图
+  num_workers: 4
+
+mode:
+  offline_test: false   # true 时用简单层替换所有预训练模块
+  seed: 42
+  device: "cuda:1"         # "cuda", "cpu"
+
+distributed:
+  enabled: true       # true 时启用多卡 DDP 训练（自动按下方 gpus 列表 spawn 多进程）
+  gpus: ["cuda:0", "cuda:1"]   # 参与训练的 GPU 列表（每个 GPU 一个训练进程）
+  backend: "nccl"       # 分布式后端（单机多卡用 nccl）
