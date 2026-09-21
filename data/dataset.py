@@ -268,7 +268,7 @@ def bucket_collate(batch):
     # caption padding
     caption_ids = [b[4] for b in batch]
     max_len = max((len(c) for c in caption_ids), default=0)
-    max_len = max(max_len, 1)  # 至少 1 列（全空 caption → 全 PAD + 全 mask）
+    max_len = max(max_len, 1)  # 至少 1 列
 
     padded = torch.full((len(batch), max_len), PAD_ID, dtype=torch.long)
     mask = torch.ones((len(batch), max_len), dtype=torch.bool)  # True = padding
@@ -277,5 +277,12 @@ def bucket_collate(batch):
         if L > 0:
             padded[i, :L] = torch.tensor(c[:L], dtype=torch.long)
             mask[i, :L] = False
+        else:
+            # P3：空 caption（该图不在 caption.txt 中）不能整行都是 padding。
+            # 全 True mask → TransformerEncoder / CrossAttn 里 masked_fill(-inf)
+            # 后 softmax 全 -inf → 确定性 NaN。这里留 1 个非 padding 位（PAD id，
+            # 其 embedding 恒为 0），与推理端 inferencer._make_caption 的
+            # "零序列 + 全 False mask" 处理方式一致。
+            mask[i, 0] = False
 
     return I_p, I_s, I_t, buckets, padded, mask

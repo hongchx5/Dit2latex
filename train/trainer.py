@@ -16,6 +16,7 @@ import random
 from typing import Dict, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -75,6 +76,26 @@ class Trainer:
         self.global_step = 0
         self.best_loss = float("inf")
 
+        # NaN 监控（P0）：累计 NaN 步数 / 连续 NaN 步数 / 本日志窗口被 scaler 跳过的步数
+        self.nan_steps = 0
+        self.consecutive_nan = 0
+        self.window_skipped = 0
+
+        # 混合精度（P1）：按配置显式指定 dtype。
+        # - fp16：需要 GradScaler（上限 65504，易溢出）
+        # - bf16：与 fp32 同指数位（上限 3.4e38），不需要 GradScaler
+        mp = config.training.mixed_precision
+        self.amp_enabled = mp in ("fp16", "bf16")
+        self.amp_dtype = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }.get(mp, None)
+        if mp not in ("no", "fp16", "bf16"):
+            raise ValueError(
+                f"training.mixed_precision must be one of 'no'/'fp16'/'bf16', got {mp!r}"
+            )
+        self.use_scaler = (mp == "fp16")
+
         if self.is_main:
             os.makedirs(config.training.checkpoint_dir, exist_ok=True)
             os.makedirs(config.training.log_dir, exist_ok=True)
@@ -82,7 +103,7 @@ class Trainer:
         else:
             self.writer = None
 
-        self.scaler = torch.cuda.amp.GradScaler(enabled=config.training.mixed_precision != "no")
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_scaler)
 
     # ── 桶循环辅助 ───────────────────────────────────────────────────
 
@@ -181,12 +202,41 @@ class Trainer:
             caption_mask = caption_mask.to(self.device)
             # I_s：路径列表（正常模式）或 tensor 列表（offline 模式），无需搬运
 
-            with torch.cuda.amp.autocast(enabled=cfg.mixed_precision != "no"):
+            with torch.cuda.amp.autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
                 outputs = self.model(I_p, I_s, I_t, caption_ids, caption_mask)
 
             loss = outputs["loss"]
             diff_loss = outputs["diff_loss"].item()
             percep_loss = outputs["percep_loss"].item()
+
+            # ── P0：非有限损失保护 ──────────────────────────────────
+            # 前向一旦产出 inf/NaN 就不能反传：权重会停在触发溢出的状态，
+            # 之后每个 batch 都溢出（本次崩溃即空转 75750 步的根因）。
+            loss_finite = bool(torch.isfinite(loss))
+            if self.world_size > 1 and dist.is_available() and dist.is_initialized():
+                # DDP：各 rank 拿到的是不同样本，是否 NaN 必须全体一致，
+                # 否则有的 rank 反传、有的不反传，backward 的 all-reduce 会挂死。
+                flag = torch.tensor([1.0 if loss_finite else 0.0], device=loss.device)
+                dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+                loss_finite = float(flag.item()) > 0.5
+
+            if not loss_finite:
+                self.optimizer.zero_grad(set_to_none=True)
+                self.nan_steps += 1
+                self.consecutive_nan += 1
+                if self.is_main:
+                    self.writer.add_scalar("Train/nan_steps", self.nan_steps, self.global_step)
+                    print(f"[NaN] step {self.global_step}: loss={loss.item()} "
+                          f"(nan_steps={self.nan_steps}, consecutive={self.consecutive_nan}), skipped")
+                if self.consecutive_nan >= cfg.nan_abort_steps:
+                    raise RuntimeError(
+                        f"Loss has been non-finite for {self.consecutive_nan} consecutive steps "
+                        f"(total NaN steps: {self.nan_steps}); aborting at step {self.global_step}. "
+                        f"Check Train/scale and Train/grad_norm: a collapsing scale with a "
+                        f"stable grad_norm means dtype overflow."
+                    )
+                continue
+            self.consecutive_nan = 0
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
@@ -198,8 +248,13 @@ class Trainer:
                 cfg.gradient_clip,
             )
 
+            # 记录 scaler 是否跳过了这一步（梯度含 inf/NaN 时 scale 会减半）
+            scale_before = self.scaler.get_scale()
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            if self.scaler.get_scale() < scale_before:
+                self.window_skipped += 1
+
             self.scheduler.step()
             self.ema.update(self.pipeline)
 
@@ -218,14 +273,22 @@ class Trainer:
 
                 self.writer.add_scalar("Loss/diffusion", avg_diff, self.global_step)
                 self.writer.add_scalar("Loss/perceptual", avg_percep, self.global_step)
-                self.writer.add_scalar("Loss/total", avg_diff + avg_percep, self.global_step)
+                # P5-B3：total 必须乘感知损失权重，否则日志量级与实际训练损失不符
+                self.writer.add_scalar(
+                    "Loss/total",
+                    avg_diff + cfg.perceptual_loss_weight * avg_percep,
+                    self.global_step,
+                )
                 self.writer.add_scalar("Train/lr", lr, self.global_step)
                 self.writer.add_scalar("Train/grad_norm", grad_norm.item(), self.global_step)
+                self.writer.add_scalar("Train/scale", self.scaler.get_scale(), self.global_step)
+                self.writer.add_scalar("Train/skipped", self.window_skipped, self.global_step)
                 self.writer.add_scalar("Train/bucket_h", current_bucket[0], self.global_step)
                 self.writer.add_scalar("Train/bucket_w", current_bucket[1], self.global_step)
                 running_diff_loss = 0.0
                 running_percep_loss = 0.0
                 running_steps = 0
+                self.window_skipped = 0
 
             # 终端显示：每步实时更新（percep 仅在开启感知损失时显示）
             if pbar is not None:
@@ -262,6 +325,9 @@ class Trainer:
         """在验证集上计算平均损失（用 EMA 参数，仅 rank 0 执行）。"""
         if not self.is_main:
             return
+        # P5-C1：先用 EMA 权重覆盖，验证结束后必须还原训练权重，
+        # 否则每验证一次训练权重就被 EMA 权重替换一次。
+        backup = {k: v.detach().clone() for k, v in self.pipeline.state_dict().items()}
         self.ema.apply_to(self.pipeline)
         self.pipeline.eval()
 
@@ -275,7 +341,8 @@ class Trainer:
                 I_t = I_t.to(self.device)
                 caption_ids = caption_ids.to(self.device)
                 caption_mask = caption_mask.to(self.device)
-                outputs = self.pipeline(I_p, I_s, I_t, caption_ids, caption_mask)
+                with torch.cuda.amp.autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+                    outputs = self.pipeline(I_p, I_s, I_t, caption_ids, caption_mask)
                 total_val_loss += outputs["loss"].item()
                 total_val_diff += outputs["diff_loss"].item()
                 total_val_percep += outputs["percep_loss"].item()
@@ -292,6 +359,7 @@ class Trainer:
         self.writer.add_scalar("Val/perceptual", avg_percep, self.global_step)
 
         print(f"\n[Step {self.global_step}] Val loss: {avg_loss:.6f} (diff: {avg_diff:.4f}, percep: {avg_percep:.4f})")
+        self.pipeline.load_state_dict(backup)   # P5-C1：还原训练权重
         self.pipeline.train()
 
     def _save_checkpoint(self, is_final: bool = False):
@@ -309,6 +377,33 @@ class Trainer:
             step=self.global_step,
         )
         print(f"Checkpoint saved: {path}")
+
+        # P5-C4：只保留最近 save_max 个周期性 checkpoint（final 不参与清理）
+        if not is_final:
+            self._prune_checkpoints(getattr(self.config.training, "save_max", 0))
+
+    def _prune_checkpoints(self, save_max: int):
+        """删除旧的 checkpoint_step_*.pt，只保留最近 save_max 个（save_max<=0 表示不限制）。"""
+        if save_max is None or save_max <= 0:
+            return
+        ckpt_dir = self.config.training.checkpoint_dir
+        if not os.path.isdir(ckpt_dir):
+            return
+        step_files = []
+        for name in os.listdir(ckpt_dir):
+            if name.startswith("checkpoint_step_") and name.endswith(".pt"):
+                stem = name[len("checkpoint_step_"):-len(".pt")]
+                if stem.isdigit():
+                    step_files.append((int(stem), os.path.join(ckpt_dir, name)))
+        if len(step_files) <= save_max:
+            return
+        step_files.sort(key=lambda x: x[0])
+        for _, path in step_files[: len(step_files) - save_max]:
+            try:
+                os.remove(path)
+                print(f"Checkpoint removed (keep last {save_max}): {path}")
+            except OSError as e:
+                print(f"Failed to remove checkpoint {path}: {e}")
 
     def resume(
         self,

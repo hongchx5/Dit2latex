@@ -34,7 +34,7 @@ class DiTtolatexPipeline(nn.Module):
         caption_encoder: nn.Module,
         dit: nn.Module,
         noise_schedule: NoiseSchedule,
-        perceptual_loss: PerceptualLoss,
+        perceptual_loss: Optional[PerceptualLoss],   # weight=0 时可为 None（不构建 VGG）
         perceptual_loss_weight: float = 0.1,
         cfg_dropout_rate: float = 0.1,
         device: str = "cuda",
@@ -110,8 +110,8 @@ class DiTtolatexPipeline(nn.Module):
         # 8. 扩散损失
         diff_loss = simple_diffusion_loss(noise_pred, noise)
 
-        # 9. 感知损失（weight=0 时跳过 decode + VGG，避免 0*NaN 污染 total_loss）
-        if self.perceptual_loss_weight > 0:
+        # 9. 感知损失（weight=0 或未提供损失模块时跳过 decode + VGG，避免 0*NaN 污染 total_loss）
+        if self.perceptual_loss_weight > 0 and self.perceptual_loss is not None:
             alpha_bar = self.noise_schedule.alphas_cumprod[t].view(B, 1, 1, 1)
             safe_mask = (alpha_bar > 0.05).float().view(B)
             safe_count = safe_mask.sum()

@@ -37,15 +37,17 @@ training:
   min_lr: 1.0e-6
   ema_decay: 0.9999
   cfg_dropout_rate: 0.1  # CFG 训练时的风格条件丢弃概率
-  perceptual_loss_weight: 0.001
+  perceptual_loss_weight: 0.0   # P4：先关掉（VAE.decode 带 no_grad ⇒ 该损失零梯度，纯浪费算力）
   bucket_steps: 500      # 一个桶连续训练的步数，之后随机换桶
   val_every: 1000
   log_every: 50
-  save_every: 15000
+  save_every: 15000        # 不改；配合 save_max 控制磁盘占用
+  save_max: 5              # 只保留最近 5 个周期性 checkpoint（final 不参与清理，0=不限）
+  nan_abort_steps: 50      # 连续多少步 loss 非有限就中止训练（防静默空转）
   checkpoint_dir: "./checkpoints"
-  log_dir: "./logs"
+  log_dir: "./logs"        # 实际写入 logs/exp_XXXX/（自动创建，见 main.py）
   gradient_clip: 1.0
-  mixed_precision: "fp16"  # "no", "fp16", "bf16"
+  mixed_precision: "bf16"  # "no", "fp16", "bf16"（P1：bf16 与 fp32 同指数位，消除溢出型 NaN）
 
 diffusion:
   num_timesteps: 1000

@@ -24,6 +24,16 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    QK-Norm（SD3 / Flux 同款）：对最后一维做 RMS 归一化。
+
+    无参数、不改变 state_dict，旧 checkpoint 可直接加载。
+    内部升到 fp32 计算，避免 fp16 下 x.pow(2) 自身溢出。
+    """
+    return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps).to(x.dtype)
+
+
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """
     Args:
@@ -103,13 +113,26 @@ class RotaryPositionEmbedding2D(nn.Module):
 class SelfAttention(nn.Module):
     """Multi-head Self-Attention + 2D RoPE。"""
 
-    def __init__(self, dim: int, num_heads: int = 12, dropout: float = 0.0, use_rope: bool = True):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 12,
+        dropout: float = 0.0,
+        use_rope: bool = True,
+        qk_norm: bool = True,
+    ):
+        """
+        Args:
+            qk_norm: True 时对 q/k 做 RMS 归一化后再点积（P2，fp16 防溢出关键）。
+                     无新增参数，不影响 checkpoint 兼容性。
+        """
         super().__init__()
         assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}"
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.use_rope = use_rope
+        self.qk_norm = qk_norm
 
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
@@ -135,6 +158,12 @@ class SelfAttention(nn.Module):
 
         if self.rotary is not None:
             q, k = self.rotary(q, k, coords)
+
+        # QK-Norm：把 q/k 的 RMS 拉回 1，点积量级不再随 AdaLN 的放大而增长，
+        # fp16 下 logits 不会冲到 65504 以上（本次 NaN 崩溃的主因之一）。
+        if self.qk_norm:
+            q = rms_norm(q)
+            k = rms_norm(k)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, H, N, N)
         attn = F.softmax(attn, dim=-1)

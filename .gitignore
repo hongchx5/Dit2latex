@@ -8,3 +8,6 @@ style_cache/
 __pycache__/
 .codewhale/
 eval_output/
+_diag/
+.workbuddy/
+训练NaN排查报告.md

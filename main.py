@@ -15,7 +15,10 @@ from __future__ import annotations
 import argparse
 import random
 import os
+import re
+import shutil
 import socket
+from typing import Optional
 
 import numpy as np
 import torch
@@ -105,8 +108,11 @@ def build_pipeline(config: Config) -> DiTtolatexPipeline:
         device=device,
     )
 
-    # 感知损失
-    perceptual_loss = build_perceptual_loss(device=device)
+    # 感知损失（P4：weight=0 时连 VGG 都不构建，省显存）
+    perceptual_loss = (
+        build_perceptual_loss(device=device)
+        if config.training.perceptual_loss_weight > 0 else None
+    )
 
     # 管线
     pipeline = DiTtolatexPipeline(
@@ -122,6 +128,31 @@ def build_pipeline(config: Config) -> DiTtolatexPipeline:
     )
 
     return pipeline
+
+
+def _make_exp_dir(base_log_dir: str, config_path: Optional[str] = None) -> str:
+    """
+    在 log_dir 下创建自增的实验目录 logs/exp_0001、exp_0002 ...（每次运行一个）。
+
+    TensorBoard 的 events 文件写入该子目录，避免多次运行把曲线混进同一个 event 文件。
+    同时把本次使用的配置文件复制进去，便于事后复现。
+    """
+    os.makedirs(base_log_dir, exist_ok=True)
+    ids = [
+        int(m.group(1))
+        for d in os.listdir(base_log_dir)
+        if (m := re.fullmatch(r"exp_(\d+)", d)) and os.path.isdir(os.path.join(base_log_dir, d))
+    ]
+    exp_id = max(ids, default=0) + 1
+    exp_dir = os.path.join(base_log_dir, f"exp_{exp_id:04d}")
+    os.makedirs(exp_dir, exist_ok=True)
+
+    if config_path and os.path.exists(config_path):
+        try:
+            shutil.copy(config_path, os.path.join(exp_dir, "config.yaml"))
+        except OSError as e:
+            print(f"[warn] failed to copy config to {exp_dir}: {e}")
+    return exp_dir
 
 
 def _find_free_port() -> int:
@@ -184,7 +215,7 @@ def _build_bucket_loaders(
     return bucket_loaders, bucket_samplers
 
 
-def _ddp_worker(local_rank: int, config_path: str, resume: str, world_size: int, port: int):
+def _ddp_worker(local_rank: int, config_path: str, resume: str, world_size: int, port: int, exp_dir: str):
     """每个 GPU 一个进程的训练入口（由 torch.multiprocessing.spawn 启动）。"""
     # 初始化进程组
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -197,6 +228,7 @@ def _ddp_worker(local_rank: int, config_path: str, resume: str, world_size: int,
 
     config = load_config(config_path)
     config.mode.device = config.distributed.gpus[local_rank]
+    config.training.log_dir = exp_dir        # 所有进程共用父进程创建的实验目录
     set_config(config)
     set_seed(config.mode.seed + local_rank)  # 各进程随机序列不同
 
@@ -263,18 +295,22 @@ def cmd_train(args):
                     f"Requested {world_size} GPUs but only {torch.cuda.device_count()} available: {gpus}"
                 )
             port = _find_free_port()
+            exp_dir = _make_exp_dir(config.training.log_dir, args.config)
             print(f"Starting DDP training on {world_size} GPUs {gpus} "
                   f"(master port {port}) ...")
+            print(f"TensorBoard log dir: {exp_dir}")
             set_config(config)
             mp.spawn(
                 _ddp_worker,
-                args=(args.config, args.resume, world_size, port),
+                args=(args.config, args.resume, world_size, port, exp_dir),
                 nprocs=world_size,
                 join=True,
             )
             return
 
     # 单卡（或回退）模式
+    config.training.log_dir = _make_exp_dir(config.training.log_dir, args.config)
+    print(f"TensorBoard log dir: {config.training.log_dir}")
     set_config(config)
     set_seed(config.mode.seed)
 

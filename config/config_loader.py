@@ -67,6 +67,8 @@ class TrainingConfig:
     val_every: int = 1000
     log_every: int = 50
     save_every: int = 5000
+    save_max: int = 5                # 只保留最近 N 个周期性 checkpoint（0 = 不限制）
+    nan_abort_steps: int = 50        # 连续 N 步 loss 非有限则中止训练
     checkpoint_dir: str = "./checkpoints"
     log_dir: str = "./logs"
     gradient_clip: float = 1.0
