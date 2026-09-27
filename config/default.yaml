@@ -25,13 +25,13 @@ model:
 
   caption:
     enabled: true        # 是否载入 caption embed（false 则不创建 CaptionEncoder/caption cross-attn）
-    num_layers: 1        # caption TransformerEncoder 层数
-    max_len: 256         # caption 最大 token 长度
+    num_layers: 2        # caption TransformerEncoder 层数
+    max_len: 256        # caption 最大 token 长度
 
 training:
   total_steps: 450000
-  batch_size: 8          # 每步的 (I_p, I_s 组, I_t) 三元组数
-  lr: 1.0e-4
+  batch_size: 16          # 每步的 (I_p, I_s 组, I_t) 三元组数
+  lr: 2.0e-5
   weight_decay: 1.0e-4
   warmup_steps: 2000
   min_lr: 1.0e-6
@@ -41,7 +41,7 @@ training:
   bucket_steps: 500      # 一个桶连续训练的步数，之后随机换桶
   val_every: 1000
   log_every: 50
-  save_every: 15000        # 不改；配合 save_max 控制磁盘占用
+  save_every: 10000        # 不改；配合 save_max 控制磁盘占用
   save_max: 5              # 只保留最近 5 个周期性 checkpoint（final 不参与清理，0=不限）
   nan_abort_steps: 50      # 连续多少步 loss 非有限就中止训练（防静默空转）
   checkpoint_dir: "./checkpoints"

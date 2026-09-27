@@ -60,8 +60,8 @@ DiTtoLatex/
 
 # 预计算风格 tile 特征缓存（可选，加速训练首轮）
 
-python scripts/precompute_style_cache.py 
-    --data_root ./data --cache_dir ./style_cache 
+python scripts/precompute_style_cache.py
+    --data_root ./data --cache_dir ./style_cache
     --model_name ./pretrained/openai/clip-vit-base-patch32
 
 # 正常模式训练
@@ -95,9 +95,9 @@ python main.py infer --checkpoint checkpoints/checkpoint_step_0157500.pt --print
 
 python main.py infer --print_path data/print/img1.png --style_path data/style1/img2.png --output result.png --caption "x + 1 = 2"
 
-python main.py infer --checkpoint checkpoints/128x512_0157500.pt --print_path data/print/106_carlos.png --style_path data/test1/18_em_0.bmp --output a1.png --caption "y ^ { 4 } + y + 1 = 0"
+python main.py infer --checkpoint checkpoints/exp_002/checkpoint_step_0110000.pt --print_path data/print/106_carlos.png --style_path data/test1/18_em_0.bmp --output a1.png --caption "y ^ { 4 } + y + 1 = 0"
 
-python main.py infer --checkpoint checkpoints/128x512_0157500.pt --print_path /home/user/data3/daxger9/HMER/pdf2img/img/temp/a9.png --style_path data/style1/18_em_3.png --output eval_output/a9.png --caption "`f ( x ) = \frac { x } { 2 + x }`"
+python main.py infer --checkpoint checkpoints/exp_002/checkpoint_step_0410000.pt --print_path /home/user/data3/daxger9/HMER/pdf2img/img/val_dataset/val_dataset-cambria/20260921031917-3.png --style_path data/style2/18_em_3.png --output eval_output/val_dataset/20260921031917-3.png --caption "9 7 7 f - 5 3 v l \leq - s - \sigma"
 
 # 冒烟测试（无数据也可运行：全部用假数据验证形状/梯度/采样链路）
 
