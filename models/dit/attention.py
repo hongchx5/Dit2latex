@@ -9,6 +9,8 @@ Cross-Attention（Q 来自 DiT 特征，K/V 来自风格序列）不施加 DiT g
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -82,17 +84,26 @@ class RotaryPositionEmbedding2D(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         coords: torch.Tensor,
+        rope_scale: Optional[tuple] = None,
     ) -> tuple:
         """
         Args:
             q, k: (B, H, N, head_dim)
             coords: (N, 2) float，每行 [row, col] 坐标（row ∈ [0, grid_h)，col ∈ [0, grid_w)）。
+            rope_scale: 可选 (s_h, s_w) 逐轴缩放（FiT 的 VisionNTK / VisionYaRN 外推用）。
+                        传入时坐标先按轴缩放再算频率，用于推理分辨率超出训练长度的场景。
+                        默认 None = 不缩放（训练与同预算推理的行为与原来完全一致）。
         Returns:
             (q_rot, k_rot)：旋转后的 (B, H, N, head_dim)
         """
         B, H, N, D = q.shape
         assert D == self.head_dim
         h = self.half
+
+        if rope_scale is not None:
+            s_h, s_w = float(rope_scale[0]), float(rope_scale[1])
+            scale_t = torch.tensor([s_h, s_w], dtype=coords.dtype, device=coords.device)
+            coords = coords / scale_t  # 拉长坐标间隔 == 相对降低频率，等价长度外推
 
         cos_row, sin_row = self._cos_sin_1d(coords[:, 0])
         cos_col, sin_col = self._cos_sin_1d(coords[:, 1])
@@ -143,11 +154,22 @@ class SelfAttention(nn.Module):
         else:
             self.rotary = None
 
-    def forward(self, x: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        coords: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        rope_scale: Optional[tuple] = None,
+    ) -> torch.Tensor:
         """
         Args:
             x: (B, N, dim) patch token 序列。
             coords: (N, 2) float 坐标网格（row, col）。
+            attn_mask: (B, N) bool，True = padding（可变分辨率下 canvas 的空白 token）。
+                       作为 **key mask** 使用：padding 位置不会被任何 query 看到。
+                       注意：不能让某一行 query 对应的 key 全被 mask（会 softmax 出 NaN），
+                       每个样本至少有 1 个真实 token，因此安全。
+            rope_scale: 可选 (s_h, s_w)，见 RotaryPositionEmbedding2D。
         Returns:
             (B, N, dim)
         """
@@ -157,7 +179,7 @@ class SelfAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, H, N, head_dim)
 
         if self.rotary is not None:
-            q, k = self.rotary(q, k, coords)
+            q, k = self.rotary(q, k, coords, rope_scale=rope_scale)
 
         # QK-Norm：把 q/k 的 RMS 拉回 1，点积量级不再随 AdaLN 的放大而增长，
         # fp16 下 logits 不会冲到 65504 以上（本次 NaN 崩溃的主因之一）。
@@ -166,6 +188,9 @@ class SelfAttention(nn.Module):
             k = rms_norm(k)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, H, N, N)
+        if attn_mask is not None:
+            # (B, N) -> (B, 1, 1, N)：只 mask key，不 mask query（避免整行 -inf → NaN）
+            attn = attn.masked_fill(attn_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 

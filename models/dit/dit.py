@@ -13,6 +13,13 @@ use_caption=False 时，DiTBlock 不创建 caption Cross-Attention（AdaLN 3 组
 caption_seq/caption_mask 参数被忽略（可传 None）。
 
 支持动态/静态分桶：latent 尺寸由输入形状决定，位置信息由 2D RoPE 提供。
+
+可变分辨率（FiT 式）：
+  - 每张图的 patch token 数 grid_h × grid_w 由 token 预算决定，batch 内通过
+    canvas 对齐形状，空白 token 用 attn_mask（(B, N) bool，True=padding）屏蔽：
+    Self-Attention 里当 key 被 mask 掉，输出清零，损失里也不计数。
+  - use_grid_cond=True 时把 (grid_h, grid_w) 作为尺度条件拼进 AdaLN 的 c
+    （cond_dim 由 2×hidden 变 3×hidden，因此该开关会改变参数量，需从头训练）。
 """
 
 from __future__ import annotations
@@ -58,6 +65,35 @@ class TimestepEmbedder(nn.Module):
         return self.mlp(t_emb)
 
 
+class GridScaleEmbedder(nn.Module):
+    """
+    网格尺度条件：(grid_h, grid_w) → 条件向量。
+
+    可变分辨率下光靠相对坐标（RoPE）无法区分「5×50」和「16×16」这类
+    同样 token 数、物理尺度却完全不同的输入；把网格尺寸喂给 AdaLN，
+    模型就能知道当前的绝对尺度。归一化到 ref（≈√max_tokens）后再进 MLP，
+    避免随分辨率增大而量级爆炸。
+    """
+
+    def __init__(self, hidden_dim: int, ref: float = 16.0):
+        super().__init__()
+        self.ref = float(ref)
+        self.mlp = nn.Sequential(
+            nn.Linear(2, hidden_dim, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim, bias=True),
+        )
+
+    def forward(self, grid_h: int, grid_w: int, batch: int) -> torch.Tensor:
+        """返回 (batch, hidden_dim)。"""
+        device = next(self.mlp.parameters()).device
+        v = torch.tensor(
+            [[float(grid_h) / self.ref, float(grid_w) / self.ref]],
+            dtype=torch.float32, device=device,
+        )
+        return self.mlp(v).expand(batch, -1)
+
+
 class DiT(nn.Module):
     def __init__(
         self,
@@ -73,12 +109,15 @@ class DiT(nn.Module):
         caption_dim: Optional[int] = None,
         dropout: float = 0.0,
         use_caption: bool = True,
+        use_grid_cond: bool = True,
+        grid_ref: float = 16.0,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.out_channels = out_channels
         self.patch_size = patch_size
         self.use_caption = use_caption
+        self.use_grid_cond = use_grid_cond
         # caption 特征维度默认跟随 hidden_dim（CaptionEncoder 输出维度 = hidden_dim）
         if caption_dim is None:
             caption_dim = hidden_dim
@@ -99,8 +138,13 @@ class DiT(nn.Module):
             nn.SiLU(),
         )
 
-        # cond_dim = t_emb(hidden_dim) + f_s_proj(hidden_dim)
-        cond_dim = hidden_dim * 2
+        # 网格尺度条件（可选）：(grid_h, grid_w) → hidden_dim
+        self.grid_embedder = (
+            GridScaleEmbedder(hidden_dim, ref=grid_ref) if use_grid_cond else None
+        )
+
+        # cond_dim = t_emb(hidden_dim) + f_s_proj(hidden_dim) [+ grid_emb(hidden_dim)]
+        cond_dim = hidden_dim * (3 if use_grid_cond else 2)
 
         # DiT Blocks
         self.blocks = nn.ModuleList([
@@ -168,6 +212,8 @@ class DiT(nn.Module):
         caption_seq: Optional[torch.Tensor],
         caption_mask: Optional[torch.Tensor],
         t: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        rope_scale: Optional[tuple] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -177,6 +223,9 @@ class DiT(nn.Module):
             caption_seq:  (B, L, caption_dim) — latex caption 序列（use_caption=False 时忽略，可为 None）
             caption_mask: (B, L) bool — caption padding mask（同上）
             t:            (B,) — 扩散时间步
+            attn_mask:    (B, N) bool — patch token padding mask，True=padding
+                          （可变分辨率：canvas 上内容区之外的 token；推理时通常传 None）
+            rope_scale:   可选 (s_h, s_w) — RoPE 逐轴外推缩放（超预算推理时才用）
 
         Returns:
             epsilon: (B, 4, latent_h, latent_w) — 预测噪声（仅前 latent_dim 通道）
@@ -196,15 +245,24 @@ class DiT(nn.Module):
         f_s_proj = self.style_pool_proj(f_s_pooled)  # (B, hidden_dim)
 
         # 拼接条件向量
-        c = torch.cat([t_emb, f_s_proj], dim=-1)  # (B, 2 * hidden_dim)
+        if self.grid_embedder is not None:
+            grid_emb = self.grid_embedder(grid_h, grid_w, B)   # (B, hidden_dim)
+            c = torch.cat([t_emb, f_s_proj, grid_emb], dim=-1)  # (B, 3 * hidden_dim)
+        else:
+            c = torch.cat([t_emb, f_s_proj], dim=-1)            # (B, 2 * hidden_dim)
 
         # 逐层处理
         for block in self.blocks:
-            x = block(x, c, f_s_seq, caption_seq, caption_mask, coords)
+            x = block(x, c, f_s_seq, caption_seq, caption_mask, coords,
+                      attn_mask=attn_mask, rope_scale=rope_scale)
 
         # 输出头
         x = self.final_norm(x)
         x = self.final_proj(x)  # (B, N, patch_dim)
+
+        # padding token 的输出清零（它们不参与注意力、也不计损失，避免数值噪声外溢）
+        if attn_mask is not None:
+            x = x.masked_fill(attn_mask.unsqueeze(-1), 0.0)
 
         # rearrange 回 latent 空间
         p = self.patch_size

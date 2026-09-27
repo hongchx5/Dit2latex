@@ -21,6 +21,10 @@
 风格列表与输出列表一一对应：第 i 个风格跑完所有内容图，结果存到第 i 个输出文件夹，
 文件名与内容图文件名保持一致。
 
+输出尺寸：可变分辨率推理下每张内容图按 data.max_tokens 的 token 预算等比缩放，
+因此不同宽高比的图输出尺寸不同（不再统一 128×384）。加 --restore_size 可还原到
+内容图的原始像素尺寸。
+
 用法示例：
     python scripts/batch_infer.py \
         --config config/default.yaml \
@@ -168,6 +172,9 @@ def parse_args():
                         help="只跑前 N 张内容图（0 或负数表示全部），用于快速验证")
     parser.add_argument("--skip_existing", action="store_true",
                         help="输出文件已存在时跳过（便于断点续跑）")
+    parser.add_argument("--restore_size", action="store_true",
+                        help="把生成结果还原到内容图的原始像素尺寸"
+                             "（默认输出模型分辨率，即 token 预算缩放后的尺寸）")
     parser.add_argument("--empty_cache_every", type=int, default=50,
                         help="每生成多少张清一次 CUDA 缓存（0 表示不清）")
     return parser.parse_args()
@@ -247,6 +254,7 @@ def main():
                     style_image=style_path,
                     output_path=out_path,
                     caption=caption,
+                    restore_original_size=args.restore_size,
                 )
             except Exception as e:  # 单张失败不中断整批
                 msg = f"[fail] {content_path} | style={style_path} | {type(e).__name__}: {e}"

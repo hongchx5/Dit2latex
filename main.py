@@ -87,6 +87,7 @@ def build_pipeline(config: Config) -> DiTtolatexPipeline:
         latent_dim=config.model.dit.latent_dim,
         context_dim=config.model.style_encoder.feature_dim,
         use_caption=config.model.caption.enabled,
+        use_grid_cond=config.model.dit.use_grid_cond,
     ).to(device)
 
     # caption 编码器（latex token → 序列特征；开关关闭时不创建）
@@ -209,8 +210,10 @@ def _build_bucket_loaders(
 
         if rank == 0:
             tag = " (distributed)" if sampler is not None else " (shared)"
-            print(f"  bucket {bucket[0]}x{bucket[1]}: {len(indices)} samples, "
-                  f"{len(loader)} batches{tag}")
+            unit = config.model.vae.f * config.model.dit.patch_size
+            gh, gw = bucket[0] // unit, bucket[1] // unit
+            print(f"  bucket {bucket[0]}x{bucket[1]} ({gh}x{gw}={gh*gw} tokens): "
+                  f"{len(indices)} samples, {len(loader)} batches{tag}")
 
     return bucket_loaders, bucket_samplers
 
@@ -259,19 +262,24 @@ def _ddp_worker(local_rank: int, config_path: str, resume: str, world_size: int,
 
 
 def _build_train_dataset(config: Config) -> HandwrittenFormulaDataset:
-    """构建静态分桶训练数据集（all_size 分类 + train_size 过滤）。"""
-    buckets = [tuple(b) for b in config.data.all_size]
-    train_size = tuple(config.data.train_size) if config.data.train_size else None
+    """
+    构建可变分辨率训练数据集（FiT 式 token 预算 + 宽高比自动分箱）。
+
+    data.all_size / data.train_size 已废弃（仅供 data/classify_print_by_bucket.py 使用）。
+    """
     return HandwrittenFormulaDataset(
         data_root=config.data.data_root,
-        buckets=buckets,
-        train_size=train_size,
+        max_tokens=config.data.max_tokens,
+        min_grid_h=config.data.min_grid_h,
+        num_aspect_bins=config.data.num_aspect_bins,
+        only_downscale=config.data.only_downscale,
         repeats_per_image=config.data.repeats_per_image,
         styles_per_repeat=config.data.styles_per_repeat,
         style_as_tensor=config.mode.offline_test,
         tile_size=config.data.tile_size,
         tile_stride=config.data.tile_stride,
         vae_f=config.model.vae.f,
+        patch_size=config.model.dit.patch_size,
         caption_path=config.data.caption_path,
         dictionary_path=config.data.dictionary_path,
         use_caption=config.model.caption.enabled,

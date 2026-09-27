@@ -6,6 +6,8 @@ DDIM (Denoising Diffusion Implicit Models) 采样器。
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
@@ -25,6 +27,8 @@ def ddim_sample(
     num_steps: int = 50,
     eta: float = 0.0,
     cfg_scale: float = 3.0,
+    attn_mask: Optional[torch.Tensor] = None,
+    rope_scale: Optional[tuple] = None,
 ) -> torch.Tensor:
     """
     DDIM 采样（CFG：无条件分支同时置零内容 z_p、风格、caption）。
@@ -41,6 +45,8 @@ def ddim_sample(
         num_steps:      DDIM 步数。
         eta:            DDIM η（0=确定性，1=DDPM）。
         cfg_scale:      CFG 引导系数。
+        attn_mask:      (B, N) bool，token padding mask（推理无 padding 时传 None）。
+        rope_scale:     可选 (s_h, s_w)，推理超出训练长度时的 RoPE 外推缩放。
 
     Returns:
         z_0: 去噪后的潜在表示 (B, 4, H, W)。
@@ -59,7 +65,8 @@ def ddim_sample(
 
         # 有条件预测
         eps_cond = pipeline.predict_noise(
-            z_t_prime, f_s_pooled, f_s_seq, caption_seq, caption_mask, t_now, t_batch
+            z_t_prime, f_s_pooled, f_s_seq, caption_seq, caption_mask, t_now, t_batch,
+            attn_mask=attn_mask, rope_scale=rope_scale,
         )
 
         # 无条件预测：内容 z_p=0、风格=0、caption=0（整体条件 CFG）
@@ -68,7 +75,8 @@ def ddim_sample(
         f_zero_seq = torch.zeros_like(f_s_seq)
         caption_zero = torch.zeros_like(caption_seq) if caption_seq is not None else None
         eps_uncond = pipeline.predict_noise(
-            z_t_prime_uncond, f_zero, f_zero_seq, caption_zero, caption_mask, t_now, t_batch
+            z_t_prime_uncond, f_zero, f_zero_seq, caption_zero, caption_mask, t_now, t_batch,
+            attn_mask=attn_mask, rope_scale=rope_scale,
         )
 
         # CFG

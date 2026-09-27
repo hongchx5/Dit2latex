@@ -21,6 +21,7 @@ class DiTConfig:
     in_channels: int = 8
     out_channels: int = 8
     latent_dim: int = 4
+    use_grid_cond: bool = True    # 把 (grid_h, grid_w) 尺度和时间步/风格一起注入 AdaLN
 
 
 @dataclass
@@ -90,8 +91,13 @@ class DataConfig:
     image_size: int = 256            # 旧版正方形边长（兼容保留，分桶模式下不使用）
     all_size: list = field(default_factory=lambda: [
         [64, 512], [96, 512], [128, 512], [128, 384], [256, 256],
-    ])                               # 全部桶集合 (H, W)，用于图片分类
-    train_size: list = field(default_factory=lambda: [128, 512])  # 训练尺寸（单个，必须属于 all_size）
+    ])                               # 【已废弃】仅 data/classify_print_by_bucket.py 使用
+    train_size: list = field(default_factory=lambda: [128, 384])  # 【已废弃】同上，训练已改用 max_tokens
+    # ── FiT 式可变分辨率（token 预算）─────────────────────────────
+    max_tokens: int = 256            # patch token 预算：grid_h × grid_w ≤ 256（1 token = 16px）
+    min_grid_h: int = 5              # 仅统计：缩放后 grid_h < 5 的样本占比（不做任何约束）
+    num_aspect_bins: int = 8         # 宽高比自动分箱数量（= canvas 桶数量）
+    only_downscale: bool = True      # True：小图不放大（只缩放到预算内）
     style_cache_dir: str = "./style_cache"  # 风格 tile 特征缓存目录
     tile_size: int = 224             # 风格图平铺切分边长
     tile_stride: int = 168           # 风格图平铺切分步长

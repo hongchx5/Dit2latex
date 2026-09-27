@@ -86,7 +86,8 @@ python main.py train --config config/default.yaml
 
 python main.py train --config config/default.yaml
 
-# 推理（静态分桶：print 图等比缩放 + 白填充到 config.data.train_size，输出固定 train_size 尺寸）
+# 推理（可变分辨率：print 图按 data.max_tokens 的 token 预算等比缩放，保留原始宽高比，
+#      输出尺寸随输入宽高比变化；风格参考图任意分辨率均可）
 
 python main.py infer --print_path data/print/img1.png --style_path data/style1/img2.png --output result.png
 python main.py infer --checkpoint checkpoints/checkpoint_step_0157500.pt --print_path data/print/95_miguel.png --style_path data/style1/76_miguel.png --output result.png

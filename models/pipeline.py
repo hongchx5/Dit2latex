@@ -59,16 +59,20 @@ class DiTtolatexPipeline(nn.Module):
         I_t: torch.Tensor,
         caption_ids: torch.Tensor,
         caption_mask: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> dict:
         """
         训练前向：计算扩散损失和感知损失。
 
         Args:
-            I_p:          打印体图像 (B, 3, bucket_h, bucket_w)（同桶 batch）
+            I_p:          打印体图像 (B, 3, canvas_h, canvas_w)（同 canvas batch）
             I_s:          风格参考图路径列表 (B,)，或 tensor 列表（offline 模式）
-            I_t:          目标手写图像 (B, 3, bucket_h, bucket_w)
+            I_t:          目标手写图像 (B, 3, canvas_h, canvas_w)
             caption_ids:  (B, L) long，latex token id
             caption_mask: (B, L) bool，True=padding
+            token_mask:   (B, N) bool，patch token 级 padding mask（True=canvas 空白区）。
+                          可变分辨率训练时必须传：内容区之外的 token 不算损失。
+                          推理（无 padding）传 None 即可。
 
         Returns:
             dict with keys: 'loss', 'diff_loss', 'percep_loss'
@@ -104,11 +108,14 @@ class DiTtolatexPipeline(nn.Module):
         # 6. 拼接 z_t' = [z_t; z_p]
         z_t_prime = torch.cat([z_t, z_p], dim=1)  # (B, 8, latent_h, latent_w)
 
-        # 7. DiT 预测噪声（含 ControlNet 内容注入 + caption cross-attn）
-        noise_pred = self.dit(z_t_prime, f_s_seq, f_s_pooled, caption_seq, caption_mask, t)
+        # 7. DiT 预测噪声（含 ControlNet 内容注入 + caption cross-attn + token padding mask）
+        noise_pred = self.dit(
+            z_t_prime, f_s_seq, f_s_pooled, caption_seq, caption_mask, t,
+            attn_mask=token_mask,
+        )
 
-        # 8. 扩散损失
-        diff_loss = simple_diffusion_loss(noise_pred, noise)
+        # 8. 扩散损失（只在真实 token 上统计）
+        diff_loss = simple_diffusion_loss(noise_pred, noise, token_mask=token_mask)
 
         # 9. 感知损失（weight=0 或未提供损失模块时跳过 decode + VGG，避免 0*NaN 污染 total_loss）
         if self.perceptual_loss_weight > 0 and self.perceptual_loss is not None:
@@ -165,6 +172,8 @@ class DiTtolatexPipeline(nn.Module):
         caption_mask: torch.Tensor,
         t_scalar: float,
         t_tensor: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        rope_scale: Optional[tuple] = None,
     ) -> torch.Tensor:
         """
         预测噪声 ε̂（CFG 由 ddim_sample 在外部组织）。
@@ -177,8 +186,13 @@ class DiTtolatexPipeline(nn.Module):
             caption_mask: (B, L) bool
             t_scalar:     时间步标量（保留兼容）
             t_tensor:     (B,) 时间步
+            attn_mask:    (B, N) bool，token padding mask（推理无 padding 时传 None）
+            rope_scale:   可选 (s_h, s_w)，推理分辨率超出训练长度时的 RoPE 外推缩放
 
         Returns:
             noise_pred: (B, 4, latent_h, latent_w)
         """
-        return self.dit(z_t_prime, f_s_seq, f_s_pooled, caption_seq, caption_mask, t_tensor)
+        return self.dit(
+            z_t_prime, f_s_seq, f_s_pooled, caption_seq, caption_mask, t_tensor,
+            attn_mask=attn_mask, rope_scale=rope_scale,
+        )

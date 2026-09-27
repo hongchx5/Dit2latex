@@ -7,6 +7,8 @@ use_caption=False：SA / style-CA / MLP（AdaLN 3 组，不创建 caption 模块
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
@@ -71,15 +73,19 @@ class DiTBlock(nn.Module):
         caption_seq: torch.Tensor,
         caption_mask: torch.Tensor,
         coords: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        rope_scale: Optional[tuple] = None,
     ) -> torch.Tensor:
         """
         Args:
             x:            patch token 序列 (B, N, hidden_dim)
-            c:            条件向量 (B, cond_dim)，来自 [t_emb, f_s_pooled]
+            c:            条件向量 (B, cond_dim)，来自 [t_emb, f_s_pooled, (grid_emb)]
             f_s_seq:      风格特征序列 (B, M, context_dim)
             caption_seq:  latex caption 特征序列 (B, L, caption_dim)，use_caption=False 时忽略
             caption_mask: (B, L) bool，True=padding
             coords:       2D 坐标网格 (N, 2)
+            attn_mask:    (B, N) bool，True=padding（可变分辨率 canvas 的空白 token）
+            rope_scale:   可选 (s_h, s_w) RoPE 逐轴外推缩放
 
         Returns:
             (B, N, hidden_dim)
@@ -94,8 +100,10 @@ class DiTBlock(nn.Module):
              s2, sc2, g2,          # Style Cross-Attention
              s3, sc3, g3) = self.adaln(c)  # MLP
 
-        # Self-Attention 路径（2D RoPE）
-        x = x + g1.unsqueeze(1) * self.self_attn(modulate(x, s1, sc1), coords)
+        # Self-Attention 路径（2D RoPE + padding mask）
+        x = x + g1.unsqueeze(1) * self.self_attn(
+            modulate(x, s1, sc1), coords, attn_mask=attn_mask, rope_scale=rope_scale
+        )
 
         # Style Cross-Attention 路径
         x = x + g2.unsqueeze(1) * self.cross_attn(modulate(x, s2, sc2), f_s_seq)

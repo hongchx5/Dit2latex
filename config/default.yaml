@@ -12,6 +12,7 @@ model:
     in_channels: 8       # z_t' = [z_t; z_p] 拼接后的通道数
     out_channels: 8      # 输出去噪后的 8 通道，取前 4 通道作为噪声预测
     latent_dim: 4        # VAE 潜在空间通道数
+    use_grid_cond: true  # 把 (grid_h, grid_w) 尺度条件注入 AdaLN（可变分辨率下让模型知道绝对尺度）
 
   vae:
     pretrained_path: "/home/user/data3/daxger9/HMER/DiTtolatex/pretrained/stabilityai/sd-vae-ft-ema"
@@ -59,9 +60,14 @@ diffusion:
 data:
   data_root: "./data"
   image_size: 256              # 旧版正方形边长（兼容保留，分桶模式下不使用）
-  all_size:                    # 全部桶集合 (H, W)，用于图片分类
+  all_size:                    # 【已废弃】仅 data/classify_print_by_bucket.py 使用
     - [128, 384]
-  train_size: [128, 384]      # 训练尺寸（单个，必须属于 all_size；只加载分类到该尺寸的图）
+  train_size: [128, 384]       # 【已废弃】同上；训练已改用下面的 token 预算方案
+  # ── FiT 式可变分辨率（token 预算）───────────────────────────────
+  max_tokens: 256              # patch token 预算：grid_h × grid_w ≤ 256（1 token = 16px）
+  min_grid_h: 5                # 仅统计：缩放后 grid_h < 5 的样本占比，不做任何约束
+  num_aspect_bins: 8           # 宽高比自动分箱数量（= canvas 桶数量，每桶一个 DataLoader）
+  only_downscale: true         # true：小图不放大，只在超预算时缩小
   style_cache_dir: "./style_cache"   # 风格 tile 特征缓存目录
   tile_size: 224               # 风格图平铺切分边长
   tile_stride: 168             # 风格图平铺切分步长

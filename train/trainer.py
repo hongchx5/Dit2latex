@@ -51,6 +51,8 @@ class Trainer:
         self.world_size = world_size
         self.is_main = rank == 0
         self.device = config.mode.device
+        # 1 个 patch token 的像素边长（用于日志换算 token 数）
+        self.unit = config.model.vae.f * config.model.dit.patch_size
 
         # DDP 包装：world_size > 1 时启用（nccl 需要 device_ids）
         if world_size > 1:
@@ -112,9 +114,13 @@ class Trainer:
         bucket_ids: list,
         total_steps: int,
         bucket_steps: int,
+        bucket_loaders: Optional[Dict] = None,
     ) -> list:
         """
         用共享随机种子生成确定性桶切换序列，保证所有 DDP 进程同步换桶。
+
+        可变分辨率下桶 = 宽高比分箱的 canvas，各桶样本数可能相差很大，
+        因此按样本数加权抽样（否则罕见宽高比会被过度训练）。
 
         序列长度 = 换桶次数 + 2（覆盖全程，末尾截断）。相邻桶不重复。
         """
@@ -124,7 +130,10 @@ class Trainer:
         n_switches = total_steps // max(1, bucket_steps) + 2
         for _ in range(n_switches):
             pool = [b for b in bucket_ids if b != prev] if len(bucket_ids) > 1 else bucket_ids
-            b = rng.choice(pool)
+            weights = None
+            if bucket_loaders and len(pool) > 1:
+                weights = [max(1, len(bucket_loaders[b].dataset)) for b in pool]
+            b = rng.choices(pool, weights=weights, k=1)[0] if weights else rng.choice(pool)
             seq.append(b)
             prev = b
         return seq
@@ -165,7 +174,9 @@ class Trainer:
 
         # 确定性桶序列（所有进程一致）
         bucket_ids = list(bucket_loaders.keys())
-        bucket_sequence = self._build_bucket_sequence(bucket_ids, total_steps, bucket_steps)
+        bucket_sequence = self._build_bucket_sequence(
+            bucket_ids, total_steps, bucket_steps, bucket_loaders
+        )
         seq_idx = 0
         current_bucket = bucket_sequence[0]
         data_iter = self._get_iter(current_bucket, bucket_loaders, bucket_samplers)
@@ -191,19 +202,23 @@ class Trainer:
                     pbar.set_description(f"Training [bucket {current_bucket}]")
 
             try:
-                I_p, I_s, I_t, buckets, caption_ids, caption_mask = next(data_iter)
+                batch = next(data_iter)
             except StopIteration:
                 data_iter = self._get_iter(current_bucket, bucket_loaders, bucket_samplers)
-                I_p, I_s, I_t, buckets, caption_ids, caption_mask = next(data_iter)
+                batch = next(data_iter)
+
+            I_p, I_s, I_t, buckets, caption_ids, caption_mask, token_mask = batch
 
             I_p = I_p.to(self.device)
             I_t = I_t.to(self.device)
             caption_ids = caption_ids.to(self.device)
             caption_mask = caption_mask.to(self.device)
+            # token_mask：(B, N) bool，canvas 空白 token（推理/全内容 batch 时为 None）
+            token_mask = token_mask.to(self.device) if token_mask is not None else None
             # I_s：路径列表（正常模式）或 tensor 列表（offline 模式），无需搬运
 
             with torch.cuda.amp.autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
-                outputs = self.model(I_p, I_s, I_t, caption_ids, caption_mask)
+                outputs = self.model(I_p, I_s, I_t, caption_ids, caption_mask, token_mask)
 
             loss = outputs["loss"]
             diff_loss = outputs["diff_loss"].item()
@@ -285,6 +300,16 @@ class Trainer:
                 self.writer.add_scalar("Train/skipped", self.window_skipped, self.global_step)
                 self.writer.add_scalar("Train/bucket_h", current_bucket[0], self.global_step)
                 self.writer.add_scalar("Train/bucket_w", current_bucket[1], self.global_step)
+                self.writer.add_scalar(
+                    "Train/tokens",
+                    (current_bucket[0] // self.unit) * (current_bucket[1] // self.unit),
+                    self.global_step,
+                )
+                if token_mask is not None:
+                    # canvas 里空白 token 的占比：分箱越粗、padding 越多，值越大
+                    self.writer.add_scalar(
+                        "Train/pad_ratio", token_mask.float().mean().item(), self.global_step
+                    )
                 running_diff_loss = 0.0
                 running_percep_loss = 0.0
                 running_steps = 0
@@ -336,13 +361,15 @@ class Trainer:
         total_val_percep = 0.0
         num_batches = 0
         with torch.no_grad():
-            for I_p, I_s, I_t, buckets, caption_ids, caption_mask in val_loader:
+            for batch in val_loader:
+                I_p, I_s, I_t, buckets, caption_ids, caption_mask, token_mask = batch
                 I_p = I_p.to(self.device)
                 I_t = I_t.to(self.device)
                 caption_ids = caption_ids.to(self.device)
                 caption_mask = caption_mask.to(self.device)
+                token_mask = token_mask.to(self.device) if token_mask is not None else None
                 with torch.cuda.amp.autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
-                    outputs = self.pipeline(I_p, I_s, I_t, caption_ids, caption_mask)
+                    outputs = self.pipeline(I_p, I_s, I_t, caption_ids, caption_mask, token_mask)
                 total_val_loss += outputs["loss"].item()
                 total_val_diff += outputs["diff_loss"].item()
                 total_val_percep += outputs["percep_loss"].item()
