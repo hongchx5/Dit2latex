@@ -3,8 +3,9 @@
 
 流程：
 1. 内容图（print）按 token 预算等比缩放（保留原始宽高比，不做固定尺寸填充）；
-2. 风格图走平铺切分（tiling）→ CLIP → 4-query 聚合（任意分辨率参考图都先按
-   height=224 等比缩放再切块，因此分辨率不受限制）；
+2. 风格图：**整图等比缩放到 height = data.style_height**（保留宽高比，绝不压扁），
+   再走 ConvNeXt + 前景感知 4-query 聚合（任意分辨率参考图都能直接喂进来）；
+   超宽时居中裁剪并告警。type="clip_tiled" 基线仍走 tiling + 冻结 CLIP；
 3. DiT 在该图自己的 token 网格上做 DDIM 采样（无 padding）；
 4. 解码后按需还原到原始像素尺寸（--restore_size）。
 """
@@ -24,7 +25,7 @@ from models.pipeline import DiTtolatexPipeline
 from models.caption_encoder import build_vocab, encode_caption_string
 from diffusion.ddim import ddim_sample
 from data.buckets import fit_size_to_token_budget, token_unit
-from data.transforms import fit_transform_pil, tensor_to_pil
+from data.transforms import fit_transform_pil, tensor_to_pil, style_transform_pil
 
 
 class Inferencer:
@@ -39,6 +40,15 @@ class Inferencer:
         self.max_tokens = int(getattr(config.data, "max_tokens", 256))
         self.min_grid_h = int(getattr(config.data, "min_grid_h", 5))
         self.only_downscale = bool(getattr(config.data, "only_downscale", True))
+        # ── 风格编码器类型决定风格图预处理方式 ──
+        self.style_encoder_type = str(
+            getattr(config.model.style_encoder, "type", "clip_tiled")
+        ).lower()
+        self.style_height = int(
+            getattr(config.data, "style_height", None)
+            or getattr(config.model.style_encoder, "height", 64)
+        )
+        self.style_max_width = int(getattr(config.model.style_encoder, "max_width", 0) or 0) or None
         self.token2id = {}
         if config.data.dictionary_path and os.path.exists(config.data.dictionary_path):
             self.token2id, _ = build_vocab(config.data.dictionary_path)
@@ -100,7 +110,47 @@ class Inferencer:
         )
         return tensor.to(self.device).unsqueeze(0), (fit_h, fit_w), (w, h)
 
-    def _make_caption(self, caption: Optional[str]):
+    def _load_style(self, style_image: Union[str, Image.Image, torch.Tensor]):
+        """
+        风格图预处理（**不再 tiling**）：等比缩放到高度 style_height，保留宽高比。
+
+        - convnext / offline：返回 (style_tensor (1,3,H,W), style_mask (1,W))
+            推理 batch=1 ⇒ W_max = W_i，mask 全 True（无 padding）。
+            宽度超过 max_width 时**居中裁剪**并打印告警。
+        - clip_tiled 基线：原样返回路径 / PIL（tiling 在编码器内做）。
+        """
+        if self.style_encoder_type == "clip_tiled":
+            return style_image
+
+        if isinstance(style_image, str):
+            img = Image.open(style_image)
+        elif isinstance(style_image, Image.Image):
+            img = style_image
+        elif torch.is_tensor(style_image):
+            img = style_image
+        else:
+            raise TypeError(f"unsupported style_image type: {type(style_image)!r}")
+
+        if torch.is_tensor(img):
+            t = img.to(self.device)
+            if t.dim() == 3:
+                t = t.unsqueeze(0)
+        else:
+            w_before, _ = img.size
+            t = style_transform_pil(
+                img,
+                height=self.style_height,
+                max_width=self.style_max_width,
+                crop="center",
+            ).to(self.device).unsqueeze(0)
+            if self.style_max_width is not None:
+                scale = self.style_height / float(max(1, img.size[1]))
+                if int(round(w_before * scale)) > self.style_max_width:
+                    print(f"[Diag][warn] 风格图宽度 {int(round(w_before * scale))} > "
+                          f"max_width {self.style_max_width}，已居中裁剪（可能丢掉部分笔迹）")
+
+        mask = torch.ones(t.shape[0], t.shape[-1], dtype=torch.bool, device=self.device)
+        return (t, mask)
         """
         将 latex 公式字符串转为 caption 序列特征 + padding mask。
 
@@ -155,10 +205,9 @@ class Inferencer:
             print(f"[Diag][warn] grid_h={grid_h} < min_grid_h={self.min_grid_h}："
                   f"该图过于狭长，字符高度只剩 {grid_h*self.unit}px，生成质量可能下降")
 
-        # 2. 风格图：tiling + CLIP + 4-query 聚合（缓存优先）
-        #    tiling 内部会先把参考图等比缩放到 height=224 再切块，
-        #    所以任意分辨率/宽高比的参考图都能直接喂进来。
-        f_s_seq, f_s_pooled = self.pipeline.encode_style(style_image)
+        # 2. 风格图：等比缩放到 height=style_height → ConvNeXt + 前景感知 4-query 聚合
+        #    （clip_tiled 基线仍是 tiling + 冻结 CLIP，分支在 _load_style 内）
+        f_s_seq, f_s_pooled = self.pipeline.encode_style(self._load_style(style_image))
 
         # 3. caption 条件
         caption_seq, caption_mask = self._make_caption(caption)

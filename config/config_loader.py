@@ -33,8 +33,23 @@ class VAEConfig:
 
 @dataclass
 class StyleEncoderConfig:
+    # ── 编码器选型 ──
+    type: str = "convnext"           # "convnext" | "clip_tiled" | "offline"
+    # ── convnext ──
+    backbone: str = "convnext_tiny"  # convnext_tiny / small / base / large
+    pretrained: bool = True          # 用 ImageNet-1K 权重初始化（阶段 A/B 用 ImageNet 起步）
+    height: int = 64                 # 风格图固定高度 H（等比缩放，保留宽高比）
+    max_width: int = 512             # 8 * H；超出则训练随机裁剪 / 推理居中裁剪
+    num_query: int = 4               # f_s_seq 的长度 M
+    fg_threshold: float = 0.0        # 前景阈值（[-1,1] 域；白=+1，墨迹=-1）
+    pad_side: str = "right"          # batch 内宽度 padding 的一侧
+    init_ckpt: str = ""              # 阶段 A/B 产出的权重路径；空 = 随机 / ImageNet 初始化
+    freeze_backbone: bool = False    # 阶段 C 必须为 False（联合微调）
+    backbone_lr_scale: float = 0.5   # backbone 参数组相对主 lr 的缩放
+    # ── clip_tiled 基线（type="clip_tiled" 时生效）──
     model_name: str = "openai/clip-vit-base-patch32"
-    feature_dim: int = 768
+    # ── 通用 ──
+    feature_dim: int = 768           # ConvNeXt-T stage4 通道数；改动需同步 DiT context_dim
     num_style_images: int = 3
 
 
@@ -98,9 +113,10 @@ class DataConfig:
     min_grid_h: int = 5              # 仅统计：缩放后 grid_h < 5 的样本占比（不做任何约束）
     num_aspect_bins: int = 8         # 宽高比自动分箱数量（= canvas 桶数量）
     only_downscale: bool = True      # True：小图不放大（只缩放到预算内）
-    style_cache_dir: str = "./style_cache"  # 风格 tile 特征缓存目录
-    tile_size: int = 224             # 风格图平铺切分边长
-    tile_stride: int = 168           # 风格图平铺切分步长
+    style_cache_dir: str = "./style_cache"  # 风格 tile 特征缓存目录（仅 clip_tiled 基线使用）
+    tile_size: int = 224             # 风格图平铺切分边长（仅 clip_tiled 基线使用）
+    tile_stride: int = 168           # 风格图平铺切分步长（仅 clip_tiled 基线使用）
+    style_height: int = 64           # 风格图基准高度 H（须与 model.style_encoder.height 一致）
     caption_path: str = "data/caption.txt"        # latex 公式 caption 文件
     dictionary_path: str = "data/dictionary.txt"  # latex 词表文件
     repeats_per_image: int = 3

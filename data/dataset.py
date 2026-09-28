@@ -35,7 +35,7 @@ from data.buckets import (
     token_unit,
     ContentRect,
 )
-from data.transforms import fit_transform_pil
+from data.transforms import fit_transform_pil, pad_style_batch, style_transform_pil
 from models.caption_encoder import build_vocab, encode_caption_string, PAD_ID
 
 
@@ -59,7 +59,10 @@ class HandwrittenFormulaDataset(Dataset):
         only_downscale: bool = True,
         repeats_per_image: int = 3,
         styles_per_repeat: int = 3,
-        style_as_tensor: bool = False,
+        style_as_tensor: bool = True,
+        style_height: int = 64,
+        style_max_width: Optional[int] = None,
+        style_crop: str = "random",
         tile_size: int = 224,
         tile_stride: int = 168,
         vae_f: int = 8,
@@ -78,8 +81,12 @@ class HandwrittenFormulaDataset(Dataset):
             only_downscale: True 时小图不放大。
             repeats_per_image: 每张 print 图重复几轮风格采样。
             styles_per_repeat: 每轮从同风格中选几张 I_s。
-            style_as_tensor: True 时风格图以原始尺寸 tensor 返回（offline 测试模式）。
-            tile_size / tile_stride: 风格图平铺切分参数。
+            style_as_tensor: True（默认）= 风格图已缩放到 style_height 的 tensor；
+                             False = 只返回路径 str（clip_tiled 基线：tiling 在编码器内做）。
+            style_height:   风格图基准高度 H（等比缩放，保留宽高比，绝不压扁）。
+            style_max_width: 风格图宽度上限；超过时按 style_crop 裁一段（防 OOM）。
+            style_crop:     "random"（训练）/ "center"（验证、推理）。
+            tile_size / tile_stride: 风格图平铺切分参数（仅 clip_tiled 基线使用）。
             vae_f / patch_size: 用于 token 网格换算。
             caption_path / dictionary_path / use_caption: caption 相关。
             verbose: 是否打印分桶与统计信息。
@@ -97,6 +104,9 @@ class HandwrittenFormulaDataset(Dataset):
         self.repeats_per_image = repeats_per_image
         self.styles_per_repeat = styles_per_repeat
         self.style_as_tensor = style_as_tensor
+        self.style_height = int(style_height)
+        self.style_max_width = int(style_max_width) if style_max_width else None
+        self.style_crop = style_crop
         self.tile_size = tile_size
         self.tile_stride = tile_stride
         self.verbose = verbose
@@ -275,20 +285,29 @@ class HandwrittenFormulaDataset(Dataset):
         return tensor, rect
 
     def _load_style_image(self, path: Path) -> Union[str, torch.Tensor]:
-        """加载风格图：默认返回路径（tiling 在 style_encoder 内做），offline 模式返回 tensor。"""
+        """
+        加载风格图。
+
+        - style_as_tensor=True（默认，ConvNeXt 风格编码器）：
+          打开 → RGB → 等比缩放到高度 style_height → ToTensor → [-1, 1]，
+          返回 (3, H, W_i) tensor。缩放在 worker 进程内完成（主进程只做 padding）。
+        - style_as_tensor=False（clip_tiled 基线）：返回路径 str，tiling 在编码器内做。
+        """
         if self.style_as_tensor:
             with Image.open(path) as img:
-                img = img.convert("RGB")
-            import torchvision.transforms as T
-            tensor = T.ToTensor()(img) * 2.0 - 1.0  # [-1, 1]，保持原始尺寸
-            return tensor
+                return style_transform_pil(
+                    img,
+                    height=self.style_height,
+                    max_width=self.style_max_width,
+                    crop=self.style_crop,
+                )
         return str(path)
 
     def __getitem__(self, idx: int):
         """
         Returns:
             I_p:        (3, canvas_h, canvas_w) in [-1, 1]
-            I_s:        风格图路径 str，或 (3, H, W) tensor（offline 模式）
+            I_s:        风格图 tensor (3, style_height, W_i) in [-1,1]，或路径 str（clip_tiled 基线）
             I_t:        (3, canvas_h, canvas_w) in [-1, 1]
             bucket:     (canvas_h, canvas_w) 元组
             caption_ids: list[int]，latex 公式 token id 序列（use_caption=False 时恒空）
@@ -333,12 +352,20 @@ class HandwrittenFormulaDataset(Dataset):
 
 def bucket_collate(batch):
     """
-    自定义 collate：I_p / I_t 同 canvas 堆叠，I_s 保持路径列表，bucket 信息堆叠，
+    自定义 collate：I_p / I_t 同 canvas 堆叠，I_s 打包成 (tensor, mask)，bucket 信息堆叠，
     caption 序列 padding 到 batch 内最大长度，并按内容区生成 token padding mask。
+
+    I_s 的两种形态（由 dataset.style_as_tensor 决定）：
+      - True（默认，ConvNeXt 风格编码器）：二元组 (style_tensor, style_mask)
+            style_tensor : (B, 3, H, W_max) float，[-1,1]，padding 用 **+1.0（背景色白）**
+            style_mask   : (B, W_max) bool，True = 真实区域，False = padding
+      - False（clip_tiled 基线）：保持 List[str] 路径列表
+
+    两种形态下**元组个数都保持不变**（本分支仍为 7 元组）。
 
     Returns:
         I_p:          (B, 3, canvas_h, canvas_w)
-        I_s:          list，长度 B
+        I_s:          见上（二元组 或 路径列表）
         I_t:          (B, 3, canvas_h, canvas_w)
         buckets:      (B, 2) long
         caption_ids:  (B, L) long
@@ -349,7 +376,11 @@ def bucket_collate(batch):
     I_t = torch.stack([b[2] for b in batch], dim=0)
     buckets = torch.tensor([list(b[3]) for b in batch], dtype=torch.long)
 
+    # ── 风格图：tensor 模式 → batch 内 padding 到 W_max + valid_mask ──
+    # padding 在主进程做（dataset 侧已完成缩放）；填充值必须是 +1.0（背景色）。
     I_s = [b[1] for b in batch]
+    if torch.is_tensor(I_s[0]):
+        I_s = pad_style_batch(I_s, pad_value=1.0, pad_side="right")
 
     # ── token padding mask（内容区之外的 patch token）─────────────
     rects: List[ContentRect] = [b[5] for b in batch]

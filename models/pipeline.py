@@ -66,7 +66,9 @@ class DiTtolatexPipeline(nn.Module):
 
         Args:
             I_p:          打印体图像 (B, 3, canvas_h, canvas_w)（同 canvas batch）
-            I_s:          风格参考图路径列表 (B,)，或 tensor 列表（offline 模式）
+            I_s:          风格条件，两种形态：
+                            - convnext / offline：(style_tensor (B,3,H,W_max), style_mask (B,W_max))
+                            - clip_tiled 基线   ：(B,) 风格图路径列表
             I_t:          目标手写图像 (B, 3, canvas_h, canvas_w)
             caption_ids:  (B, L) long，latex token id
             caption_mask: (B, L) bool，True=padding
@@ -83,8 +85,19 @@ class DiTtolatexPipeline(nn.Module):
         z_p = self.vae.encode(I_p)   # (B, 4, latent_h, latent_w)
         z_0 = self.vae.encode(I_t)   # (B, 4, latent_h, latent_w) — 目标潜在
 
-        # 2. 风格编码（tiling + 4-query 聚合）
+        # 2. 风格编码
+        #    convnext：整图输入 + 前景感知 4-query 聚合（在线前向，不缓存 —— 需要反传）
+        #    clip_tiled：tiling + 冻结 CLIP + 4-query 聚合（走 tile 特征缓存）
         f_s_seq, f_s_pooled = self.style_encoder.encode(I_s)  # (B, M, 768), (B, 768)
+
+        # 风格特征塌缩监控：f_s_pooled 各通道在 batch 内的标准差均值
+        # （度量学习常见失败模式是塌成常数向量 ⇒ std → 0）
+        # B=1 时 std 会是 NaN（自由度校正），这里直接记 0 避免污染日志
+        with torch.no_grad():
+            if f_s_pooled.shape[0] > 1:
+                f_s_std = f_s_pooled.detach().float().std(dim=0).mean()
+            else:
+                f_s_std = torch.zeros((), device=f_s_pooled.device)
 
         # 3. caption 编码（caption_encoder 为 None 时跳过，caption_seq=None）
         caption_seq = None
@@ -138,6 +151,7 @@ class DiTtolatexPipeline(nn.Module):
             "loss": total_loss,
             "diff_loss": diff_loss,
             "percep_loss": percep_loss,
+            "f_s_std": f_s_std,
         }
 
     # ── 无梯度解码辅助 ───────────────────────────────────────────────
@@ -153,6 +167,13 @@ class DiTtolatexPipeline(nn.Module):
         return self.vae.encode(I_p)
 
     def encode_style(self, I_s):
+        """
+        风格条件编码（推理用）。
+
+        I_s 两种形态：
+          - convnext / offline：(style_tensor (1,3,H,W), style_mask (1,W))
+          - clip_tiled 基线   ：风格图路径 str / PIL 图（tiling 在编码器内做）
+        """
         return self.style_encoder.encode(I_s)
 
     def encode_caption(self, caption_ids: torch.Tensor, caption_mask: torch.Tensor):

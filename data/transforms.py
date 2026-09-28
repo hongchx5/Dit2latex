@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import math
+import random
 from typing import List, Optional, Tuple
 
 from PIL import Image
@@ -200,6 +201,137 @@ def tiles_to_batch(
 ) -> torch.Tensor:
     """tile tensor 列表 → 批量 tensor (T, 3, tile_size, tile_size)。"""
     return torch.stack(tiles, dim=0)
+
+
+# ── 风格图：整图输入预处理（ConvNeXt 风格编码器用）────────────────
+#
+# 与 tiling 的区别：不再切块，而是「等比缩放到固定基准高度 H + 动态宽度」，
+# 保留宽高比（公式图长宽比可到 1:10+，压扁会毁掉笔迹特征）。
+# 归一化沿用项目的 [-1, 1]（白底 +1 / 墨迹 -1），与 I_p / I_t 一致。
+
+
+def style_resize_to_height(
+    image: Image.Image,
+    height: int = 64,
+    max_width: Optional[int] = None,
+    crop: str = "none",
+    resample: int = Image.BICUBIC,
+) -> Image.Image:
+    """
+    风格图：等比缩放到高度 = height（**绝不压扁**，宽度按原宽高比推导）。
+
+    Args:
+        image:   输入 PIL Image（任意模式，内部转 RGB）。
+        height:  基准高度 H。
+        max_width: 宽度上限；缩放后宽度超过它时按 crop 裁一段：
+                   - "none"  ：不裁剪（宽度保持，可能超过 max_width）
+                   - "random"：随机裁一段（训练）
+                   - "center"：居中裁一段（验证 / 推理）
+        crop:    见 max_width 说明。
+        resample: 重采样方式，默认 BICUBIC（与项目其余部分一致）。
+
+    Returns:
+        PIL Image，尺寸 (height, W)，W ≥ 1。
+    """
+    img = image.convert("RGB")
+    w, h = img.size
+    if h <= 0 or w <= 0:
+        raise ValueError(f"empty style image: size={img.size}")
+
+    new_w = max(1, int(round(w * float(height) / float(h))))
+    resized = img.resize((new_w, height), resample)
+
+    if max_width is not None and new_w > max_width and crop != "none":
+        if crop == "center":
+            x0 = (new_w - max_width) // 2
+        elif crop == "random":
+            x0 = random.randint(0, new_w - max_width)
+        else:
+            raise ValueError(f"crop must be 'none'/'random'/'center', got {crop!r}")
+        resized = resized.crop((x0, 0, x0 + max_width, height))
+
+    return resized
+
+
+def style_transform_pil(
+    image: Image.Image,
+    height: int = 64,
+    max_width: Optional[int] = None,
+    crop: str = "none",
+    resample: int = Image.BICUBIC,
+) -> torch.Tensor:
+    """
+    风格图 → tensor：等比缩放到高度 height 后归一化到 [-1, 1]。
+
+    Returns:
+        tensor (3, height, W) in [-1, 1]（白底 +1，墨迹 -1）
+    """
+    resized = style_resize_to_height(
+        image, height=height, max_width=max_width, crop=crop, resample=resample
+    )
+    tensor = T.ToTensor()(resized)   # [0, 1]
+    return tensor * 2.0 - 1.0        # [-1, 1]
+
+
+def style_transform_path(
+    path: str,
+    height: int = 64,
+    max_width: Optional[int] = None,
+    crop: str = "center",
+    resample: int = Image.BICUBIC,
+) -> torch.Tensor:
+    """风格图路径 → tensor (3, height, W) in [-1, 1]（默认居中裁剪，给验证/推理用）。"""
+    with Image.open(path) as img:
+        return style_transform_pil(
+            img, height=height, max_width=max_width, crop=crop, resample=resample
+        )
+
+
+def pad_style_batch(
+    styles: List[torch.Tensor],
+    pad_value: float = 1.0,
+    pad_side: str = "right",
+    max_width: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    batch 内风格图右（或左）padding 到统一宽度。
+
+    **padding 值必须是 +1.0（背景色白）**：0 在 [-1,1] 下是灰色，
+    会引入虚假边缘，且会被前景 mask 误判成墨迹。
+
+    Args:
+        styles:   [(3, H, W_i) in [-1,1], ...]，H 必须一致。
+        pad_value: padding 填充值，默认 +1.0。
+        pad_side: "right"（默认，公式左端结构更密集）或 "left"。
+        max_width: 宽度硬上限（超过则从内容侧截断）。
+
+    Returns:
+        (style_tensor (B, 3, H, W_max), style_mask (B, W_max) bool)
+        style_mask: True = 真实区域，False = padding。
+    """
+    if not styles:
+        raise ValueError("pad_style_batch got an empty list")
+
+    B = len(styles)
+    C, H, _ = styles[0].shape
+    w_max = max(s.shape[2] for s in styles)
+    if max_width is not None:
+        w_max = min(w_max, int(max_width))
+
+    out = styles[0].new_full((B, C, H, w_max), float(pad_value))
+    mask = torch.zeros((B, w_max), dtype=torch.bool)
+
+    for i, s in enumerate(styles):
+        w = min(s.shape[2], w_max)
+        s = s[:, :, :w]
+        if pad_side == "left":
+            out[i, :, :, w_max - w:] = s
+            mask[i, w_max - w:] = True
+        else:   # right
+            out[i, :, :, :w] = s
+            mask[i, :w] = True
+
+    return out, mask
 
 
 # ── 旧接口（兼容保留）───────────────────────────────────────────────

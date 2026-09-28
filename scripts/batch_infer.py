@@ -5,7 +5,7 @@
     python main.py infer --checkpoint <ckpt> --print_path <content_img> \
         --style_path <style_img> --output <out_dir>/<img_name> --caption "<formula>"
 
-与逐张调用 `main.py infer` 的区别：**模型只加载一次**（VAE / CLIP / DiT / checkpoint），
+与逐张调用 `main.py infer` 的区别：**模型只加载一次**（VAE / 风格编码器 / DiT / checkpoint），
 然后在进程内循环生成，避免每张图都重新加载一遍权重（几百张图能省掉大量时间）。
 
 输入：

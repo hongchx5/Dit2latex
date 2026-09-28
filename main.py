@@ -63,16 +63,29 @@ def build_pipeline(config: Config) -> DiTtolatexPipeline:
         device=device,
     )
 
-    # 风格编码器（tiling + 4-query 聚合 + tile 特征缓存）
+    # 风格编码器
+    #   type="convnext"（默认）：自训 ConvNeXt-T + 整图输入 + 前景感知聚合（在线前向，无缓存）
+    #   type="clip_tiled"     ：冻结 CLIP + tiling 基线（走 tile 特征缓存），用于效果对照
+    se = config.model.style_encoder
     style_enc = build_style_encoder(
         offline_test=config.mode.offline_test,
-        model_name=config.model.style_encoder.model_name,
-        feature_dim=config.model.style_encoder.feature_dim,
+        model_name=se.model_name,
+        feature_dim=se.feature_dim,
         image_size=config.data.image_size,
         tile_size=config.data.tile_size,
         stride=config.data.tile_stride,
         cache_dir=config.data.style_cache_dir,
         device=device,
+        encoder_type=getattr(se, "type", "convnext"),
+        backbone=getattr(se, "backbone", "convnext_tiny"),
+        pretrained=getattr(se, "pretrained", True),
+        height=getattr(se, "height", 64),
+        max_width=getattr(se, "max_width", 512),
+        num_query=getattr(se, "num_query", 4),
+        fg_threshold=getattr(se, "fg_threshold", 0.0),
+        pad_side=getattr(se, "pad_side", "right"),
+        init_ckpt=getattr(se, "init_ckpt", ""),
+        freeze_backbone=getattr(se, "freeze_backbone", False),
     )
 
     # DiT（动态分辨率 + 可选 caption cross-attn）
@@ -267,6 +280,16 @@ def _build_train_dataset(config: Config) -> HandwrittenFormulaDataset:
 
     data.all_size / data.train_size 已废弃（仅供 data/classify_print_by_bucket.py 使用）。
     """
+    # 风格图的形态由编码器类型决定：
+    #   convnext / offline → 已缩放到 style_height 的 tensor（collate 打包成 (tensor, mask)）
+    #   clip_tiled         → 路径 str（tiling 在编码器内部做，走特征缓存）
+    se_type = getattr(config.model.style_encoder, "type", "convnext")
+    style_as_tensor = (se_type != "clip_tiled")
+    # data.style_height 由 model.style_encoder.height 传一份进来，避免两处配置漂移
+    style_height = int(getattr(config.data, "style_height", None)
+                       or getattr(config.model.style_encoder, "height", 64))
+    style_max_width = getattr(config.model.style_encoder, "max_width", 512)
+
     return HandwrittenFormulaDataset(
         data_root=config.data.data_root,
         max_tokens=config.data.max_tokens,
@@ -275,7 +298,10 @@ def _build_train_dataset(config: Config) -> HandwrittenFormulaDataset:
         only_downscale=config.data.only_downscale,
         repeats_per_image=config.data.repeats_per_image,
         styles_per_repeat=config.data.styles_per_repeat,
-        style_as_tensor=config.mode.offline_test,
+        style_as_tensor=style_as_tensor,
+        style_height=style_height,
+        style_max_width=style_max_width,
+        style_crop="random",
         tile_size=config.data.tile_size,
         tile_stride=config.data.tile_stride,
         vae_f=config.model.vae.f,

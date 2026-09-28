@@ -30,6 +30,22 @@ from train.optimizer import build_optimizer, build_scheduler
 from train.checkpoint import save_checkpoint, load_checkpoint, EMA
 
 
+def _move_style_batch(I_s, device):
+    """
+    把 collate 出来的风格 batch 搬到 device。
+
+    - convnext / offline：(style_tensor (B,3,H,W) 4D, style_mask (B,W) 2D) → 两个都搬
+    - clip_tiled 基线：路径列表 → 原样返回
+
+    判据同时看两个元素的 ndim：否则 batch=2 的旧式 tensor 列表会被误判成 (tensor, mask)。
+    """
+    if isinstance(I_s, (tuple, list)) and len(I_s) == 2 \
+            and torch.is_tensor(I_s[0]) and torch.is_tensor(I_s[1]) \
+            and I_s[0].dim() == 4 and I_s[1].dim() == 2:
+        return (I_s[0].to(device, non_blocking=True), I_s[1].to(device, non_blocking=True))
+    return I_s
+
+
 class Trainer:
     def __init__(
         self,
@@ -60,10 +76,19 @@ class Trainer:
         else:
             self.model = pipeline
 
+        # 风格编码器 backbone 用更小的学习率（阶段 C 联合微调）：
+        # backbone = lr * backbone_lr_scale，聚合头 / DiT = 主 lr。
+        # 非 convnext 编码器（clip_tiled 冻结 CLIP / offline）没有 backbone，退化为单一参数组。
+        backbone = getattr(getattr(pipeline, "style_encoder", None), "backbone", None)
+        backbone_lr_scale = float(
+            getattr(config.model.style_encoder, "backbone_lr_scale", 1.0)
+        )
         self.optimizer = build_optimizer(
             self.model,
             lr=config.training.lr,
             weight_decay=config.training.weight_decay,
+            backbone=backbone,
+            backbone_lr_scale=backbone_lr_scale,
         )
         self.scheduler = build_scheduler(
             self.optimizer,
@@ -189,6 +214,7 @@ class Trainer:
 
         running_diff_loss = 0.0
         running_percep_loss = 0.0
+        running_f_s_std = 0.0
         running_steps = 0
 
         while self.global_step < total_steps:
@@ -215,7 +241,9 @@ class Trainer:
             caption_mask = caption_mask.to(self.device)
             # token_mask：(B, N) bool，canvas 空白 token（推理/全内容 batch 时为 None）
             token_mask = token_mask.to(self.device) if token_mask is not None else None
-            # I_s：路径列表（正常模式）或 tensor 列表（offline 模式），无需搬运
+            # I_s：convnext/offline 模式是 (style_tensor (B,3,H,W_max), style_mask (B,W_max))，
+            #      需要搬到 device；clip_tiled 基线是路径列表，无需搬运。
+            I_s = _move_style_batch(I_s, self.device)
 
             with torch.cuda.amp.autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
                 outputs = self.model(I_p, I_s, I_t, caption_ids, caption_mask, token_mask)
@@ -276,6 +304,11 @@ class Trainer:
             self.global_step += 1
             steps_in_bucket += 1
 
+            # 风格特征是否塌缩（度量学习常见失败模式）：f_s_pooled 通道 std 应 > 0.01
+            f_s_std = outputs.get("f_s_std")
+            if f_s_std is not None:
+                running_f_s_std += float(f_s_std.detach().item())
+
             running_diff_loss += diff_loss
             running_percep_loss += percep_loss
             running_steps += 1
@@ -310,8 +343,13 @@ class Trainer:
                     self.writer.add_scalar(
                         "Train/pad_ratio", token_mask.float().mean().item(), self.global_step
                     )
+                if running_steps > 0:
+                    self.writer.add_scalar(
+                        "Train/f_s_std", running_f_s_std / running_steps, self.global_step
+                    )
                 running_diff_loss = 0.0
                 running_percep_loss = 0.0
+                running_f_s_std = 0.0
                 running_steps = 0
                 self.window_skipped = 0
 
@@ -368,6 +406,7 @@ class Trainer:
                 caption_ids = caption_ids.to(self.device)
                 caption_mask = caption_mask.to(self.device)
                 token_mask = token_mask.to(self.device) if token_mask is not None else None
+                I_s = _move_style_batch(I_s, self.device)
                 with torch.cuda.amp.autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
                     outputs = self.pipeline(I_p, I_s, I_t, caption_ids, caption_mask, token_mask)
                 total_val_loss += outputs["loss"].item()

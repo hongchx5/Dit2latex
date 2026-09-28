@@ -20,8 +20,22 @@ model:
     f: 8                 # 下采样倍率
 
   style_encoder:
+    # ── 编码器选型：convnext（新，默认）| clip_tiled（旧基线，对照用）| offline ──
+    type: "convnext"
+    # ── convnext 专用 ──
+    backbone: "convnext_tiny"
+    pretrained: true            # ImageNet-1K 初始化
+    feature_dim: 768            # ConvNeXt-T stage4 通道数，改动需同步 DiT context_dim
+    height: 64                  # 风格图固定高度 H（等比缩放，保留宽高比）
+    max_width: 512              # 8 * H；超出裁剪
+    num_query: 4                # f_s_seq 的长度 M
+    fg_threshold: 0.0           # 前景阈值（[-1,1] 域）
+    pad_side: "right"
+    init_ckpt: ""               # 阶段 A/B 产出的权重路径；空 = ImageNet 初始化
+    freeze_backbone: false      # 阶段 C 必须为 false
+    backbone_lr_scale: 0.5      # 相对主 lr 的缩放
+    # ── clip_tiled 基线专用 ──
     model_name: "/home/user/data3/daxger9/HMER/DiTtolatex/pretrained/openai/clip-vit-base-patch32"
-    feature_dim: 768
     num_style_images: 3  # 每次用几张风格参考图作为 I_s 组
 
   caption:
@@ -68,9 +82,10 @@ data:
   min_grid_h: 5                # 仅统计：缩放后 grid_h < 5 的样本占比，不做任何约束
   num_aspect_bins: 8           # 宽高比自动分箱数量（= canvas 桶数量，每桶一个 DataLoader）
   only_downscale: true         # true：小图不放大，只在超预算时缩小
-  style_cache_dir: "./style_cache"   # 风格 tile 特征缓存目录
-  tile_size: 224               # 风格图平铺切分边长
-  tile_stride: 168             # 风格图平铺切分步长
+  style_cache_dir: "./style_cache"   # 风格 tile 特征缓存目录（仅 clip_tiled 基线使用）
+  tile_size: 224               # 风格图平铺切分边长（仅 clip_tiled 基线使用）
+  tile_stride: 168             # 风格图平铺切分步长（仅 clip_tiled 基线使用）
+  style_height: 64             # 风格图基准高度 H（须与 model.style_encoder.height 一致）
   caption_path: "data/caption.txt"          # latex 公式 caption 文件
   dictionary_path: "data/dictionary.txt"    # latex 词表文件
   repeats_per_image: 3         # 每张图重复几轮
