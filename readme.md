@@ -95,7 +95,9 @@ python main.py infer --checkpoint checkpoints/checkpoint_step_0157500.pt --print
 
 python main.py infer --print_path data/print/img1.png --style_path data/style1/img2.png --output result.png --caption "x + 1 = 2"
 
-python main.py infer --checkpoint checkpoints/exp_002/checkpoint_step_0110000.pt --print_path data/print/106_carlos.png --style_path data/test1/18_em_0.bmp --output a1.png --caption "y ^ { 4 } + y + 1 = 0"
+python main.py infer --checkpoint checkpoints/exp_002/checkpoint_step_0410000.pt --print_path data/print/106_carlos.png --style_path data/test1/18_em_0.bmp --output a1.png --caption "y ^ { 4 } + y + 1 = 0"
+
+python main.py infer --checkpoint checkpoints/exp_002/checkpoint_step_0410000.pt --print_path /home/user/data3/daxger9/HMER/pdf2img/img/temp/a3.png --style_path data/style1/18_em_3.png --output eval_output/a3.png --caption "\\frac { 2 a } { - b } + \\sqrt { b ^ 2 - 4 a c }"
 
 python main.py infer --checkpoint checkpoints/exp_002/checkpoint_step_0410000.pt --print_path /home/user/data3/daxger9/HMER/pdf2img/img/val_dataset/val_dataset-cambria/20260921031917-3.png --style_path data/style2/18_em_3.png --output eval_output/val_dataset/20260921031917-3.png --caption "9 7 7 f - 5 3 v l \leq - s - \sigma"
 

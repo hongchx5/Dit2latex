@@ -29,6 +29,14 @@
         --content_dir /home/user/data3/daxger9/HMER/pdf2img/img/val_dataset/val_dataset-cambria \
         --style  data/style2/18_em_3.png  data/style3 \
         --output_dir eval_output/style_a eval_output/style_b
+
+python scripts/batch_infer.py \
+    --config config/default.yaml \
+    --checkpoint checkpoints/exp_002/checkpoint_step_0410000.pt \
+    --caption_file /home/user/data3/daxger9/HMER/latex_filling/val_dataset/generated_formulas.txt \
+    --content_dir /home/user/data3/daxger9/HMER/pdf2img/img/val_dataset/val_dataset-cambria \
+    --style  data/style1/18_em_3.png  data/style2/18_em_3.png \
+    --output_dir eval_output/exp_002/val_dataset/style1 eval_output/exp_002/val_dataset/style2
 """
 
 from __future__ import annotations
