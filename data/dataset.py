@@ -329,10 +329,18 @@ class FitDistributedSampler:
 
     def __iter__(self):
         batches = self.dataset.build_batches(self.epoch)
-        # 只保留 >= batch_size 的 batch
-        valid_batches = [b for b in batches if len(b) == self.batch_size]
-        # 按 rank 分片
-        valid_batches = valid_batches[self.rank::self.num_replicas]
+        # build_batches 已按 batch_size / drop_last 处理好，直接 DDP 分片
+        if not batches:
+            raise RuntimeError(
+                f"FitDistributedSampler rank={self.rank}: no batches generated. "
+                f"Check data.fit.batch_size / min_height / dataset size."
+            )
+        valid_batches = batches[self.rank::self.num_replicas]
+        if not valid_batches:
+            raise RuntimeError(
+                f"FitDistributedSampler rank={self.rank}: no batch left after DDP split. "
+                f"Try reducing data.fit.batch_size or increasing data."
+            )
         self.num_samples = len(valid_batches)
         self.total_size = len(valid_batches)
         self.epoch += 1
@@ -343,5 +351,7 @@ class FitDistributedSampler:
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
+
+
 
 

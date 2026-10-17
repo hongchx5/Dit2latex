@@ -167,7 +167,7 @@ def _build_fit_loader(
 ) -> tuple:
     sampler = FitDistributedSampler(
         dataset=train_dataset,
-        batch_size=config.training.batch_size,
+        batch_size=config.data.fit.batch_size,
         num_replicas=world_size,
         rank=rank,
         seed=config.data.fit.seed,
@@ -342,3 +342,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
