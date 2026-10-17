@@ -15,12 +15,12 @@ model:
     use_grid_cond: false # 是否在 AdaLN 中注入当前 grid_h/grid_w 条件
 
   vae:
-    pretrained_path: "/home/user/data3/daxger9/HMER/DiTtolatex/pretrained/stabilityai/sd-vae-ft-ema"
+    pretrained_path: "/home/user/data3/daxger9/HMER/FiT/pretrained/stabilityai/sd-vae-ft-ema"
     latent_dim: 4
     f: 8                 # 下采样倍率
 
   style_encoder:
-    model_name: "/home/user/data3/daxger9/HMER/DiTtolatex/pretrained/openai/clip-vit-base-patch32"
+    model_name: "/home/user/data3/daxger9/HMER/FiT/pretrained/openai/clip-vit-base-patch32"
     feature_dim: 768
     num_style_images: 3  # 每次用几张风格参考图作为 I_s 组
 
@@ -86,6 +86,6 @@ mode:
   device: "cuda:1"         # "cuda", "cpu"
 
 distributed:
-  enabled: true       # true 时启用多卡 DDP 训练（自动按下方 gpus 列表 spawn 多进程）
-  gpus: ["cuda:0", "cuda:1"]   # 参与训练的 GPU 列表（每个 GPU 一个训练进程）
+  enabled: false      # true 时启用多卡 DDP 训练（自动按下方 gpus 列表 spawn 多进程）
+  gpus: ["cuda:0"]   # 参与训练的 GPU 列表（每个 GPU 一个训练进程）
   backend: "nccl"       # 分布式后端（单机多卡用 nccl）

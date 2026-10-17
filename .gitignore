@@ -1,8 +1,7 @@
 checkpoints/
 logs/
 data/print/
-data/style1/
-data/style2/
+data/style*/
 pretrained/
 style_cache/
 __pycache__/
