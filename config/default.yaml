@@ -23,6 +23,15 @@ model:
     model_name: "/home/user/data3/daxger9/HMER/FiT/pretrained/openai/clip-vit-base-patch32"
     feature_dim: 768
     num_style_images: 3  # 每次用几张风格参考图作为 I_s 组
+    # 新版 ConvNeXt 风格编码器参数
+    use_convnext: true
+    image_height: 64
+    max_width: 512
+    pretrained: true
+    fg_threshold: 0.0
+    num_heads: 12
+    dropout: 0.0
+    stage_b_checkpoint: null  # 阶段 B style_encoder_final.pt 路径，阶段 C 初始化用
 
   caption:
     enabled: true        # 是否载入 caption embed（false 则不创建 CaptionEncoder/caption cross-attn）
@@ -49,6 +58,7 @@ training:
   log_dir: "./logs"        # 实际写入 logs/exp_XXXX/（自动创建，见 main.py）
   gradient_clip: 1.0
   mixed_precision: "bf16"  # "no", "fp16", "bf16"（P1：bf16 与 fp32 同指数位，消除溢出型 NaN）
+  style_backbone_lr_scale: 0.5  # 阶段 C 风格编码器 backbone 学习率缩放
 
 diffusion:
   num_timesteps: 1000

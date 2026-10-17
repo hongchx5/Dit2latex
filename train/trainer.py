@@ -51,6 +51,7 @@ class Trainer:
             self.model,
             lr=config.training.lr,
             weight_decay=config.training.weight_decay,
+            style_backbone_lr_scale=getattr(config.training, "style_backbone_lr_scale", 1.0),
         )
         self.scheduler = build_scheduler(
             self.optimizer,

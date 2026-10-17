@@ -43,6 +43,7 @@ class StyleEncoderConfig:
     fg_threshold: float = 0.0
     num_heads: int = 12
     dropout: float = 0.0
+    stage_b_checkpoint: Optional[str] = None  # 阶段 B style_encoder_final.pt 路径
 
 
 @dataclass
@@ -93,6 +94,7 @@ class TrainingConfig:
     log_dir: str = "./logs"
     gradient_clip: float = 1.0
     mixed_precision: str = "bf16"
+    style_backbone_lr_scale: float = 0.5  # 阶段 C 风格编码器 backbone 学习率缩放
 
 
 @dataclass

@@ -504,6 +504,7 @@ def build_style_encoder(
     fg_threshold: float = 0.0,
     num_heads: int = 12,
     dropout: float = 0.0,
+    stage_b_checkpoint: Optional[str] = None,
 ) -> nn.Module:
     """
     创建风格编码器实例。
@@ -511,7 +512,7 @@ def build_style_encoder(
     if offline_test:
         return OfflineStyleEncoder(feature_dim=feature_dim, image_size=image_size).to(device)
     if use_convnext:
-        return ConvNeXtStyleEncoder(
+        encoder = ConvNeXtStyleEncoder(
             feature_dim=feature_dim,
             num_query=4,
             image_height=image_height,
@@ -522,6 +523,16 @@ def build_style_encoder(
             dropout=dropout,
             device=device,
         )
+        if stage_b_checkpoint is not None:
+            ckpt = torch.load(stage_b_checkpoint, map_location=device, weights_only=True)
+            state = ckpt.get("encoder_state_dict", ckpt.get("model_state_dict", ckpt))
+            missing, unexpected = encoder.load_state_dict(state, strict=False)
+            print(f"[style_encoder] loaded stage-B checkpoint: {stage_b_checkpoint}")
+            if missing:
+                print(f"  missing keys: {missing}")
+            if unexpected:
+                print(f"  unexpected keys: {unexpected}")
+        return encoder
     return TiledCLIPStyleEncoder(
         model_name=model_name,
         feature_dim=feature_dim,

@@ -66,6 +66,7 @@ def build_pipeline(config: Config) -> DiTtolatexPipeline:
         fg_threshold=config.model.style_encoder.fg_threshold,
         num_heads=config.model.style_encoder.num_heads,
         dropout=config.model.style_encoder.dropout,
+        stage_b_checkpoint=config.model.style_encoder.stage_b_checkpoint,
     )
 
     dit = DiT(
