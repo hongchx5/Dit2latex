@@ -12,6 +12,7 @@ model:
     in_channels: 8       # z_t' = [z_t; z_p] 拼接后的通道数
     out_channels: 8      # 输出去噪后的 8 通道，取前 4 通道作为噪声预测
     latent_dim: 4        # VAE 潜在空间通道数
+    use_grid_cond: false # 是否在 AdaLN 中注入当前 grid_h/grid_w 条件
 
   vae:
     pretrained_path: "/home/user/data3/daxger9/HMER/DiTtolatex/pretrained/stabilityai/sd-vae-ft-ema"
@@ -30,15 +31,15 @@ model:
 
 training:
   total_steps: 450000
-  batch_size: 16          # 每步的 (I_p, I_s 组, I_t) 三元组数
+  batch_size: 4          # 每步的 (I_p, I_s 组, I_t) 三元组数；FiT 下这是每个动态桶内的 batch_size
   lr: 2.0e-5
   weight_decay: 1.0e-4
   warmup_steps: 2000
   min_lr: 1.0e-6
   ema_decay: 0.9999
   cfg_dropout_rate: 0.1  # CFG 训练时的风格条件丢弃概率
-  perceptual_loss_weight: 0.0   # P4：先关掉（VAE.decode 带 no_grad ⇒ 该损失零梯度，纯浪费算力）
-  bucket_steps: 500      # 一个桶连续训练的步数，之后随机换桶
+  perceptual_loss_weight: 0.0   # P4：先关掉（VAE.decode 带 no_grad => 该损失零梯度，纯浪费算力）
+  bucket_steps: 500      # 一个动态桶连续训练的步数，之后随机换桶
   val_every: 1000
   log_every: 50
   save_every: 10000        # 不改；配合 save_max 控制磁盘占用
@@ -59,9 +60,17 @@ diffusion:
 data:
   data_root: "./data"
   image_size: 256              # 旧版正方形边长（兼容保留，分桶模式下不使用）
-  all_size:                    # 全部桶集合 (H, W)，用于图片分类
-    - [128, 384]
-  train_size: [128, 384]      # 训练尺寸（单个，必须属于 all_size；只加载分类到该尺寸的图）
+  fit:
+    max_patch: 192            # 单张图 patch token 总数上限
+    patch_size: 16              # 像素级 patch 尺寸（content 图 16x16 = 1 patch）
+    latent_patch_size: 2        # DiT latent 空间 patch 尺寸
+    multiple: 8                 # 尺寸对齐粒度（VAE 下采样 8 倍）
+    min_height: 64             # 缩放后高度低于此值的图丢弃
+    batch_size: 4              # 每个动态桶的 batch 大小
+    drop_last: true            # 桶内尾部不足一个 batch 时是否丢弃
+    seed: 42                    # batch 洗牌种子
+  all_size: []                  # 已废弃：FiT 模式下不再使用固定桶列表
+  train_size: []                # 已废弃：FiT 模式下不再使用固定训练尺寸
   style_cache_dir: "./style_cache"   # 风格 tile 特征缓存目录
   tile_size: 224               # 风格图平铺切分边长
   tile_stride: 168             # 风格图平铺切分步长

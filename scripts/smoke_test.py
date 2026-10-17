@@ -1,10 +1,9 @@
-"""
-静态分桶 + caption 开关 端到端冒烟验证。
+"""FiT 可变分辨率 + caption 开关端到端冒烟验证。
 
 覆盖：
-1. 静态分桶：dataset 按 all_size 分类，只加载 train_size 的图
-2. caption 开启（use_caption=True）：DiT 前向/反向 + pipeline + DDIM
-3. caption 关闭（use_caption=False）：DiT 前向/反向（caption_seq=None）+ pipeline + DDIM
+1. FiT 动态分桶：dataset 按 patch 预算缩放并按尺寸分桶。
+2. caption 开启（use_caption=True）：DiT 前向/反向 + pipeline + DDIM。
+3. caption 关闭（use_caption=False）：DiT 前向/反向（caption_seq=None）+ pipeline + DDIM。
 
 运行：python scripts/smoke_test.py
 """
@@ -23,8 +22,6 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CAPTION = os.path.join(PROJ, "data", "caption.txt")
-DICT = os.path.join(PROJ, "data", "dictionary.txt")
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -63,40 +60,61 @@ def _build_pipe(use_caption):
     return pipe
 
 
-def test_static_bucket():
+def test_fit_bucket():
     from data.dataset import HandwrittenFormulaDataset, bucket_collate
     from torch.utils.data import DataLoader
 
-    tmp = tempfile.mkdtemp(prefix="ds_")
+    tmp = tempfile.mkdtemp(prefix="fit_ds_")
     try:
         os.makedirs(os.path.join(tmp, "print"))
         os.makedirs(os.path.join(tmp, "style1"))
-        # 不同宽高比，分别分类到不同 all_size 桶
-        make_image(os.path.join(tmp, "print", "a.png"), 512, 64)    # -> 64x512 类
-        make_image(os.path.join(tmp, "print", "b.png"), 512, 128)   # -> 128x512 类
-        make_image(os.path.join(tmp, "print", "c.png"), 256, 256)   # -> 256x256 类
-        make_image(os.path.join(tmp, "print", "d.png"), 512, 96)    # -> 96x512 类
-        for i in range(3):
+        # 多种宽高比
+        make_image(os.path.join(tmp, "print", "square.png"), 256, 256)
+        make_image(os.path.join(tmp, "print", "wide.png"), 512, 128)
+        make_image(os.path.join(tmp, "print", "narrow.png"), 128, 512)
+        make_image(os.path.join(tmp, "print", "tiny.png"), 300, 20)   # 应被 min_height 过滤
+        for i in range(6):
             make_image(os.path.join(tmp, "style1", f"s{i}.png"), 300, 128)
 
-        all_size = [(64, 512), (96, 512), (128, 512), (256, 256)]
-        train_size = (128, 512)
-
         ds = HandwrittenFormulaDataset(
-            data_root=tmp, buckets=all_size, train_size=train_size,
-            repeats_per_image=1, styles_per_repeat=1, style_as_tensor=True, vae_f=8,
+            data_root=tmp,
+            max_patch=192,
+            patch_size=16,
+            multiple=8,
+            min_height=64,
+            batch_size=2,
+            drop_last=True,
+            seed=42,
+            repeats_per_image=1,
+            styles_per_repeat=1,
+            style_as_tensor=True,
+            vae_f=8,
+            use_caption=False,
         )
-        # 只加载分类到 128x512 的图：只有 b.png（512x128）
-        assert len(ds.print_images) == 1, ds.print_images
-        assert ds.print_images[0] == "b.png"
-        assert ds.buckets_with_data() == [(128, 512)]
-        print(f"[1] static bucket: only {ds.print_images} loaded for train_size={train_size} OK")
+        assert len(ds.print_images) == 3, f"expected 3 kept, got {len(ds.print_images)}"
+        assert "tiny.png" not in ds.print_images, "tiny.png should be discarded by min_height"
+        print(f"[1] FiT filtering: {len(ds.print_images)} images kept, tiny discarded OK")
 
-        loader = DataLoader(ds, batch_size=1, collate_fn=bucket_collate)
-        I_p, I_s, I_t, buckets, cap_ids, cap_mask = next(iter(loader))
-        assert I_p.shape[2:] == (128, 512)
-        assert buckets[0].tolist() == [128, 512]
-        print(f"[1] static bucket collate: I_p {tuple(I_p.shape)} OK")
+        # 验证 build_batches 每个 batch 内尺寸一致
+        batches = ds.build_batches(epoch=0)
+        for batch in batches:
+            sizes = {ds.bucket_of_sample[i] for i in batch}
+            assert len(sizes) == 1, f"mixed sizes in batch: {sizes}"
+        print(f"[1] FiT batches: {len(batches)} batches, all uniform size OK")
+
+        # 用 DataLoader 走一遍
+        from data.dataset import FitDistributedSampler
+        sampler = FitDistributedSampler(ds, batch_size=2, num_replicas=1, rank=0, seed=42)
+        loader = DataLoader(ds, batch_size=None, sampler=sampler, collate_fn=bucket_collate)
+        seen_sizes = set()
+        for I_p, I_s, I_t, buckets, _, _ in loader:
+            h, w = I_p.shape[2], I_p.shape[3]
+            seen_sizes.add((h, w))
+            assert I_p.shape == I_t.shape
+            assert buckets[:, 0].tolist() == [h] * I_p.shape[0]
+            assert buckets[:, 1].tolist() == [w] * I_p.shape[0]
+            break  # 只验证一个 batch
+        print(f"[1] FiT DataLoader: sampled sizes {seen_sizes} OK")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -105,9 +123,9 @@ def test_caption_on():
     from diffusion.ddim import ddim_sample
     pipe = _build_pipe(use_caption=True)
 
-    # DiT 前向 + 反向
     B, L = 2, 6
-    z = torch.randn(B, 8, 16, 32, device=DEV)  # 128x256 桶 latent
+    # 固定 128x256 -> latent 16x32，与动态分辨率无关
+    z = torch.randn(B, 8, 16, 32, device=DEV)
     f_seq = torch.randn(B, 4, 192, device=DEV)
     f_pooled = torch.randn(B, 192, device=DEV)
     cap_seq = torch.randn(B, L, 192, device=DEV)
@@ -120,7 +138,6 @@ def test_caption_on():
     assert pipe.dit.blocks[0].caption_attn.to_kv.weight.grad is not None
     pipe.zero_grad()
 
-    # pipeline 端到端
     I_p = torch.rand(B, 3, 128, 256, device=DEV) * 2 - 1
     I_t = torch.rand(B, 3, 128, 256, device=DEV) * 2 - 1
     I_s = [torch.rand(3, 224, 224, device=DEV) * 2 - 1 for _ in range(B)]
@@ -132,7 +149,6 @@ def test_caption_on():
     pipe.zero_grad()
     print(f"[2] caption ON: DiT + pipeline forward/backward OK (loss={outs['loss'].item():.4f})")
 
-    # DDIM（注意：cap_mask 需与 z_t 同 batch=1，避免 batch 污染）
     with torch.no_grad():
         z_t = torch.randn(1, 4, 16, 32, device=DEV)
         z_p = torch.randn(1, 4, 16, 32, device=DEV)
@@ -152,7 +168,6 @@ def test_caption_off():
     assert pipe.caption_encoder is None
     assert pipe.dit.blocks[0].caption_attn is None
 
-    # DiT 前向 + 反向（caption_seq=None）
     B, L = 2, 6
     z = torch.randn(B, 8, 16, 32, device=DEV)
     f_seq = torch.randn(B, 4, 192, device=DEV)
@@ -163,7 +178,6 @@ def test_caption_off():
     out.mean().backward()
     pipe.zero_grad()
 
-    # pipeline 端到端（caption_ids 任意，但 encoder=None 会忽略）
     I_p = torch.rand(B, 3, 128, 256, device=DEV) * 2 - 1
     I_t = torch.rand(B, 3, 128, 256, device=DEV) * 2 - 1
     I_s = [torch.rand(3, 224, 224, device=DEV) * 2 - 1 for _ in range(B)]
@@ -175,7 +189,6 @@ def test_caption_off():
     pipe.zero_grad()
     print(f"[3] caption OFF: DiT + pipeline forward/backward OK (loss={outs['loss'].item():.4f})")
 
-    # DDIM（caption_seq=None）
     with torch.no_grad():
         z_t = torch.randn(1, 4, 16, 32, device=DEV)
         z_p = torch.randn(1, 4, 16, 32, device=DEV)
@@ -188,10 +201,10 @@ def test_caption_off():
 
 
 def main():
-    test_static_bucket()
+    test_fit_bucket()
     test_caption_on()
     test_caption_off()
-    print("\nALL STATIC-BUCKET + CAPTION-SWITCH SMOKE TESTS PASSED")
+    print("\nALL FIT + CAPTION-SWITCH SMOKE TESTS PASSED")
 
 
 if __name__ == "__main__":

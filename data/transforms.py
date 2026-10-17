@@ -1,69 +1,40 @@
 """
 图像预处理：
-- 内容图（I_p / I_t）：按桶尺寸等比缩放 + 白色居中填充（resize_and_pad_to_bucket）。
+- 内容图（I_p / I_t）：FiT 动态缩放 → 目标尺寸 (H', W')，归一化到 [-1, 1]。
 - 风格图（I_s）：平铺切分（tiling）——等比缩放到 height=224，不足 224 右填充，
   以 stride=168 滑动切出 224×224 小块，最后剩余不足 224 的块直接丢弃。
 """
 
 from __future__ import annotations
 
-import math
 from typing import List, Tuple
 
 from PIL import Image
 import torch
 from torchvision import transforms as T
 
-from data.buckets import resize_and_pad_to_bucket, FillInfo
-
-# ── 内容图：bucket 变换 ─────────────────────────────────────────────
+from data.buckets import fit_transform_pil
 
 
 def bucket_transform_pil(
     image: Image.Image,
     bucket_h: int,
     bucket_w: int,
-) -> Tuple[torch.Tensor, FillInfo]:
-    """
-    将 PIL 图像等比例缩放并白色居中填充到桶尺寸，返回归一化 tensor 与填充信息。
-
-    Args:
-        image: 输入 PIL Image。
-        bucket_h: 桶高度。
-        bucket_w: 桶宽度。
-
-    Returns:
-        (tensor (3, bucket_h, bucket_w) in [-1, 1], info)
-    """
-    img = image.convert("RGB")
-    canvas, info = resize_and_pad_to_bucket(img, bucket_h, bucket_w)
-    tensor = T.ToTensor()(canvas)          # [0, 1]
-    tensor = tensor * 2.0 - 1.0            # [-1, 1]
-    return tensor, info
+) -> Tuple[torch.Tensor, None]:
+    """兼容旧接口的 FiT 内容图变换（不再填充，不再返回 FillInfo）。"""
+    tensor = fit_transform_pil(image, bucket_h, bucket_w)
+    return tensor, None
 
 
 def bucket_transform_tensor(
     tensor: torch.Tensor,
     bucket_h: int,
     bucket_w: int,
-) -> Tuple[torch.Tensor, FillInfo]:
-    """
-    tensor 版 bucket 变换（用于已有 tensor 的输入，如推理管道）。
-
-    Args:
-        tensor: (3, H, W) in [-1, 1]。
-        bucket_h: 桶高度。
-        bucket_w: 桶宽度。
-
-    Returns:
-        (tensor (3, bucket_h, bucket_w), info)
-    """
-    _, h, w = tensor.shape
-    canvas, info = resize_and_pad_to_bucket(
-        T.ToPILImage()(tensor * 0.5 + 0.5), bucket_h, bucket_w
-    )
-    out = T.ToTensor()(canvas) * 2.0 - 1.0
-    return out, info
+) -> Tuple[torch.Tensor, None]:
+    """tensor 版兼容接口。"""
+    from data.buckets import fit_transform_tensor
+    out = fit_transform_tensor(tensor, bucket_h, bucket_w)
+    return out, None
 
 
 # ── 风格图：tiling 预处理 ───────────────────────────────────────────
@@ -76,48 +47,31 @@ def tile_image_to_tensors(
 ) -> List[torch.Tensor]:
     """
     将风格图平铺切分为 1×T 个 (3, tile_size, tile_size) 的归一化 tensor。
-
-    流程（用户确认）：
-    1. 等比例缩放到 height = tile_size；若缩放后 width < tile_size，右侧白色填充到 tile_size。
-    2. 从左到右按 stride 滑动切出 tile_size×tile_size 小块。
-    3. 最后一块剩余 width 不足 tile_size 时直接丢弃。
-
-    Args:
-        image: 输入 PIL Image。
-        tile_size: 切块边长（224）。
-        stride: 滑动步长（168）。
-
-    Returns:
-        tiles: (T, 3, tile_size, tile_size) in [-1, 1] 的列表。
     """
     img = image.convert("RGB")
     w, h = img.size
 
-    # 等比缩放到 height = tile_size
     scale = tile_size / h
     new_w = max(tile_size, int(round(w * scale)))
     new_h = tile_size
     resized = img.resize((new_w, new_h), Image.BICUBIC)
 
-    # 若 width 不足 tile_size，右侧白色填充
     if new_w < tile_size:
         canvas = Image.new("RGB", (tile_size, tile_size), (255, 255, 255))
         canvas.paste(resized, (0, 0))
         resized = canvas
         new_w = tile_size
 
-    # 滑动切块：起点 i*stride，最后剩余不足 tile_size 丢弃
     tiles: List[torch.Tensor] = []
     x0 = 0
     while x0 + tile_size <= new_w:
         tile = resized.crop((x0, 0, x0 + tile_size, tile_size))
-        tensor = T.ToTensor()(tile)   # [0, 1]
-        tensor = tensor * 2.0 - 1.0   # [-1, 1]
+        tensor = T.ToTensor()(tile)
+        tensor = tensor * 2.0 - 1.0
         tiles.append(tensor)
         x0 += stride
 
     if not tiles:
-        # 极端情况：宽度 < tile_size（缩放后被填充到 tile_size，正常不会走到这里）
         raise ValueError(f"tiling produced no tiles for image of size {img.size}")
 
     return tiles
@@ -138,17 +92,7 @@ def resize_and_pad(
     target_size: int = 256,
     fill_color: int = 255,
 ) -> Image.Image:
-    """
-    等比例缩放图像使长边 = target_size，白色填充短边居中（旧版正方形变换）。
-
-    Args:
-        image: 输入 PIL Image。
-        target_size: 目标正方形边长。
-        fill_color: 填充像素值（0-255），默认 255（白色）。
-
-    Returns:
-        正方形 PIL Image。
-    """
+    """等比例缩放图像使长边 = target_size，白色填充短边居中（旧版正方形变换）。"""
     w, h = image.size
     scale = target_size / max(w, h)
     new_w = int(w * scale)
@@ -164,11 +108,7 @@ def resize_and_pad(
 
 
 def get_transform(image_size: int = 256) -> T.Compose:
-    """
-    返回旧版训练/推理用的正方形图像变换 pipeline（兼容保留）。
-
-    - PIL → RGB → resize_and_pad → Tensor → [-1, 1] 归一化
-    """
+    """返回旧版训练/推理用的正方形图像变换 pipeline。"""
     return T.Compose([
         T.Lambda(lambda img: img.convert("RGB")),
         T.Lambda(lambda img: resize_and_pad(img, image_size)),

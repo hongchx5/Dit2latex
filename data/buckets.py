@@ -1,131 +1,196 @@
 """
-动态分桶（aspect-ratio bucketing）工具。
+FiT 可变分辨率尺寸预算工具。
 
-桶尺寸是物理图（像素）尺寸，格式统一为 (H, W)。
-默认桶集合覆盖宽图分布，所有边长满足 8×（VAE 下采样）与 2×（patch）整除：
-    (64, 1024), (96, 512), (128, 512), (128, 384), (256, 256)
-其中 96 是 32 的倍数（非严格 64 倍数），但 8 和 16 的整除均满足。
+取消固定桶列表，改为按 patch 预算动态计算内容图目标尺寸。
+核心逻辑：
+- 给定原图 (H, W)，在保持长宽比的前提下缩放；
+- 缩放后尺寸必须对齐到 multiple（=8，满足 VAE 8 倍下采样）；
+- 缩放后的 patch 数（按 content 图 16×16 像素计）不超过 max_patch；
+- 优先放大（原图 patch 不足预算时），但不超过预算；
+- 缩放后高度低于 min_height 的图被丢弃。
 
-预处理语义（用户确认）：
-- "恰好容入"：等比缩放后至少一条边等于桶对应边，另一条边不超过桶边；
-- 填充：内容居中，对称填充；水平方向奇数余量右侧多一列，垂直方向奇数余量下侧多一行；
-- 小于桶的图不放大（scale 取 min 比例，只缩小或保持原尺寸）。
+返回目标尺寸统一为 (H, W) 像素，且 H % multiple == 0、W % multiple == 0。
 """
 
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Sequence, Tuple
 
 from PIL import Image
 
-# (H, W) —— 注意顺序：高在前、宽在后
-DEFAULT_BUCKETS: List[Tuple[int, int]] = [
-    (64, 1024),
-    (96, 512),
-    (128, 512),
-    (128, 384),
-    (256, 256),
-]
-
-FillInfo = Tuple[int, int, int, int, float]
-# (offset_x, offset_y, new_w, new_h, scale) —— 用于推理时裁剪回内容区域
+import torch
+from torchvision import transforms as T
 
 
-def pick_bucket(
-    w: int,
-    h: int,
-    buckets: Sequence[Tuple[int, int]] = DEFAULT_BUCKETS,
-) -> Tuple[int, int]:
+def count_patches(H: int, W: int, patch_size: int = 16) -> int:
     """
-    选择与图片宽高比最匹配的桶（填充面积最小）。
+    按 content 图像素计算 patch 数量。
+    patch 数为整除：((H // patch_size) * (W // patch_size))。
+    """
+    if H <= 0 or W <= 0:
+        return 0
+    return (H // patch_size) * (W // patch_size)
+
+
+def _round_to_multiple(x: int, multiple: int) -> int:
+    """将整数对齐到 multiple 的最近倍数，至少为 multiple。"""
+    if x <= 0:
+        return multiple
+    return int(round(x / multiple)) * multiple
+
+
+def fit_size_to_patch_budget(
+    H: int,
+    W: int,
+    max_patch: int = 192,
+    patch_size: int = 16,
+    multiple: int = 8,
+) -> Optional[Tuple[int, int]]:
+    """
+    按 FiT patch 预算计算内容图目标尺寸 (H', W')。
+
+    规则：
+    1. H' 和 W' 都是 multiple 的倍数；
+    2. W' / H' ≈ W / H（保持宽高比，由 H' 等比推导 W' 后再对齐）；
+    3. count_patches(H', W', patch_size) <= max_patch；
+    4. 在满足约束的前提下取最大尺寸。
+
+    若 max_patch <= 0 或原图尺寸非正，返回 None。
+    若找不到满足 min_height 约束的结果，调用方应丢弃该图。
 
     Args:
-        w: 原图宽度（像素）。
-        h: 原图高度（像素）。
-        buckets: 桶集合，每项为 (bucket_h, bucket_w)。
+        H: 原图高度（像素）。
+        W: 原图宽度（像素）。
+        max_patch: 单图 patch 数上限。
+        patch_size: 像素级 patch 尺寸（content 图 16×16 = 1 patch）。
+        multiple: 目标尺寸对齐粒度（默认 8，适配 VAE 下采样）。
 
     Returns:
-        (bucket_h, bucket_w)
+        (H', W') 或 None。
     """
-    best_bucket: Optional[Tuple[int, int]] = None
-    best_pad_area = float("inf")
+    if max_patch <= 0 or H <= 0 or W <= 0:
+        return None
 
-    for bucket_h, bucket_w in buckets:
-        # contain 缩放：至少一条边恰好等于桶边
-        scale = min(bucket_h / h, bucket_w / w)
-        new_h = h * scale
-        new_w = w * scale
-        pad_area = bucket_h * bucket_w - new_w * new_h
-        if pad_area < best_pad_area:
-            best_pad_area = pad_area
-            best_bucket = (bucket_h, bucket_w)
+    def size_at(hp: int) -> Tuple[int, int]:
+        # 由 H' 等比推导理想 W'，再对齐到 multiple
+        wp = int(round(W * hp / float(H)))
+        wp = _round_to_multiple(wp, multiple)
+        # 保证至少 1 个 patch 宽度
+        min_w_pixels = max(multiple, patch_size)
+        wp = max(wp, min_w_pixels)
+        return hp, wp
 
-    assert best_bucket is not None
-    return best_bucket
+    # 上界：按面积预算 + 宽高比估算一个安全的 H 上限
+    upper = int(math.sqrt(max_patch * patch_size * patch_size * H / float(W))) + multiple * 2
+    upper = max(multiple, _round_to_multiple(upper, multiple))
+
+    lo, hi, best = multiple, upper, None
+    while lo <= hi:
+        mid = ((lo + hi) // 2 // multiple) * multiple
+        if mid < multiple:
+            mid = multiple
+        hp, wp = size_at(mid)
+        if count_patches(hp, wp, patch_size) <= max_patch:
+            best = (hp, wp)
+            lo = mid + multiple
+        else:
+            hi = mid - multiple
+
+    return best
 
 
-def resize_and_pad_to_bucket(
+def resize_to_fit(
     image: Image.Image,
-    bucket_h: int,
-    bucket_w: int,
-    fill_color: int = 255,
-    resample: int = Image.BICUBIC,
-) -> Tuple[Image.Image, FillInfo]:
+    target_h: int,
+    target_w: int,
+) -> Image.Image:
     """
-    等比缩放图像使某条边恰好容入桶，剩余方向白色居中对称填充。
+    将图像等比缩放到目标尺寸。允许轻微形变（误差由 multiple 对齐导致）。
+    放大用 BICUBIC，缩小用 BILINEAR。
 
     Args:
         image: 输入 PIL Image（RGB）。
-        bucket_h: 桶高度（像素）。
-        bucket_w: 桶宽度（像素）。
-        fill_color: 填充像素值，默认 255（白色）。
-        resample: 缩放插值方式。
+        target_h: 目标高度（像素）。
+        target_w: 目标宽度（像素）。
 
     Returns:
-        (canvas, info)，其中 canvas 为 (bucket_h, bucket_w) 的填充后图像，
-        info = (offset_x, offset_y, new_w, new_h, scale) 供推理裁剪使用。
+        缩放后的 PIL Image(target_w, target_h)。
     """
     w, h = image.size
-    scale = min(bucket_h / h, bucket_w / w)
-    new_w = int(round(w * scale))
-    new_h = int(round(h * scale))
-
-    # 保证不超出桶
-    new_w = min(new_w, bucket_w)
-    new_h = min(new_h, bucket_h)
-
-    resized = image.resize((new_w, new_h), resample)
-
-    canvas = Image.new("RGB", (bucket_w, bucket_h), (fill_color, fill_color, fill_color))
-
-    # 居中对称填充：奇数余量右侧/下侧多一列/行
-    pad_x = bucket_w - new_w
-    pad_y = bucket_h - new_h
-    offset_x = pad_x // 2          # 左留白；pad_x 为奇数时右多一列
-    offset_y = pad_y // 2          # 上留白；pad_y 为奇数时下多一行
-
-    canvas.paste(resized, (offset_x, offset_y))
-
-    info: FillInfo = (offset_x, offset_y, new_w, new_h, scale)
-    return canvas, info
+    # 按面积判断放大/缩小
+    if target_h * target_w >= h * w:
+        resample = Image.BICUBIC
+    else:
+        resample = Image.BILINEAR
+    return image.resize((target_w, target_h), resample)
 
 
-def crop_to_content(
+def fit_transform_pil(
     image: Image.Image,
-    info: FillInfo,
-) -> Image.Image:
+    target_h: int,
+    target_w: int,
+) -> torch.Tensor:
     """
-    按 FillInfo 从填充后的桶图像中裁出内容区域（推理时还原原始宽高比）。
+    内容图 FiT 预处理：按目标尺寸等比缩放并归一化到 [-1, 1]。
 
     Args:
-        image: 桶尺寸的图像（生成结果）。
-        info: resize_and_pad_to_bucket 返回的填充信息。
+        image: 输入 PIL Image。
+        target_h: 目标高度。
+        target_w: 目标宽度。
 
     Returns:
-        内容区域图像（宽高比与原图一致）。
+        tensor (3, target_h, target_w) in [-1, 1]。
     """
-    offset_x, offset_y, new_w, new_h, _ = info
-    return image.crop((offset_x, offset_y, offset_x + new_w, offset_y + new_h))
+    img = image.convert("RGB")
+    resized = resize_to_fit(img, target_h, target_w)
+    tensor = T.ToTensor()(resized)  # [0, 1]
+    tensor = tensor * 2.0 - 1.0     # [-1, 1]
+    return tensor
+
+
+def fit_transform_tensor(
+    tensor: torch.Tensor,
+    target_h: int,
+    target_w: int,
+) -> torch.Tensor:
+    """
+    tensor 版 FiT 变换。
+
+    Args:
+        tensor: (3, H, W) in [-1, 1]。
+        target_h: 目标高度。
+        target_w: 目标宽度。
+
+    Returns:
+        tensor (3, target_h, target_w) in [-1, 1]。
+    """
+    _, h, w = tensor.shape
+    resample = "bicubic" if target_h * target_w >= h * w else "bilinear"
+    tensor = tensor.unsqueeze(0)
+    tensor = torch.nn.functional.interpolate(
+        tensor, size=(target_h, target_w), mode=resample, align_corners=False,
+    )
+    return tensor.squeeze(0)
+
+
+# 旧接口兼容：保留符号但改为使用 fit_transform_pil 的语义
+# 不再返回 FillInfo，因为不再做居中填充
+
+def bucket_transform_pil(
+    image: Image.Image,
+    bucket_h: int,
+    bucket_w: int,
+) -> Tuple[torch.Tensor, None]:
+    return fit_transform_pil(image, bucket_h, bucket_w), None
+
+
+def bucket_transform_tensor(
+    tensor: torch.Tensor,
+    bucket_h: int,
+    bucket_w: int,
+) -> Tuple[torch.Tensor, None]:
+    return fit_transform_tensor(tensor, bucket_h, bucket_w), None
 
 
 def bucket_to_latent(
@@ -143,7 +208,7 @@ def bucket_to_grid(
     vae_f: int = 8,
     patch_size: int = 2,
 ) -> Tuple[int, int]:
-    """桶像素尺寸 → DiT patch token 网格 (grid_h, grid_w)。"""
+    """桶像素尺寸 → DiT latent patch grid (grid_h, grid_w)。"""
     latent_h, latent_w = bucket_to_latent(bucket_h, bucket_w, vae_f)
     return latent_h // patch_size, latent_w // patch_size
 
@@ -154,6 +219,7 @@ def bucket_tokens(
     vae_f: int = 8,
     patch_size: int = 2,
 ) -> int:
-    """桶对应的 patch token 数量。"""
+    """给定像素尺寸对应的 DiT patch token 数量。"""
     grid_h, grid_w = bucket_to_grid(bucket_h, bucket_w, vae_f, patch_size)
     return grid_h * grid_w
+
