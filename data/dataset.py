@@ -234,7 +234,8 @@ class HandwrittenFormulaDataset(Dataset):
             return tensor
         return str(path)
 
-    def __getitem__(self, idx: int):
+    def _get_single(self, idx: int):
+        """获取单个样本。"""
         print_idx = idx // self.samples_per_image
         group_idx = idx % self.samples_per_image
 
@@ -264,6 +265,17 @@ class HandwrittenFormulaDataset(Dataset):
         caption_ids = self.caption_dict.get(_stem(img_name), []) if self.use_caption else []
 
         return I_p, I_s, I_t, bucket, caption_ids
+
+    def __getitem__(self, idx):
+        """
+        支持 DataLoader 两种方式：
+        - batch_size=... + Sampler  yielding int -> idx 为 int
+        - batch_size=None + BatchSampler yielding list[int] -> idx 为 list
+        """
+        if isinstance(idx, int):
+            return self._get_single(idx)
+        # idx is a list of sample indices (one batch)
+        return [self._get_single(i) for i in idx]
 
 
 def bucket_collate(batch):
@@ -331,4 +343,5 @@ class FitDistributedSampler:
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
+
 
