@@ -223,3 +223,4 @@ def bucket_tokens(
     grid_h, grid_w = bucket_to_grid(bucket_h, bucket_w, vae_f, patch_size)
     return grid_h * grid_w
 
+

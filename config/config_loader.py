@@ -58,7 +58,7 @@ class FitConfig:
     max_patch: int = 192
     patch_size: int = 16
     latent_patch_size: int = 2
-    multiple: int = 8
+    multiple: int = 16
     min_height: int = 64
     batch_size: int = 4
     drop_last: bool = True
@@ -176,3 +176,4 @@ def set_config(cfg: Config) -> None:
     """设置全局配置单例。"""
     global _cfg
     _cfg = cfg
+

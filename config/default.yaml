@@ -64,7 +64,7 @@ data:
     max_patch: 192            # 单张图 patch token 总数上限
     patch_size: 16              # 像素级 patch 尺寸（content 图 16x16 = 1 patch）
     latent_patch_size: 2        # DiT latent 空间 patch 尺寸
-    multiple: 8                 # 尺寸对齐粒度（VAE 下采样 8 倍）
+    multiple: 16                # 尺寸对齐粒度（同时满足 VAE 8 倍 + DiT patch 2 倍）
     min_height: 64             # 缩放后高度低于此值的图丢弃
     batch_size: 4              # 每个动态桶的 batch 大小
     drop_last: true            # 桶内尾部不足一个 batch 时是否丢弃
@@ -89,3 +89,4 @@ distributed:
   enabled: false      # true 时启用多卡 DDP 训练（自动按下方 gpus 列表 spawn 多进程）
   gpus: ["cuda:0"]   # 参与训练的 GPU 列表（每个 GPU 一个训练进程）
   backend: "nccl"       # 分布式后端（单机多卡用 nccl）
+
