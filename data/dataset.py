@@ -21,6 +21,7 @@ from torch.utils.data import Dataset
 from PIL import Image
 
 from data.buckets import fit_size_to_patch_budget, fit_transform_pil
+from data.transforms import preprocess_style_image, batch_style_images
 from models.caption_encoder import build_vocab, encode_caption_string, PAD_ID
 
 
@@ -58,6 +59,10 @@ class HandwrittenFormulaDataset(Dataset):
         caption_path: Optional[str] = None,
         dictionary_path: Optional[str] = None,
         use_caption: bool = True,
+        # ---- 新版风格编码器参数 ----
+        style_image_height: int = 64,
+        style_max_width: int = 512,
+        style_random_crop: bool = True,
     ):
         super().__init__()
         self.data_root = Path(data_root)
@@ -75,6 +80,11 @@ class HandwrittenFormulaDataset(Dataset):
         self.tile_size = tile_size
         self.tile_stride = tile_stride
         self.vae_f = vae_f
+
+        # 新版风格图参数
+        self.style_image_height = style_image_height
+        self.style_max_width = style_max_width
+        self.style_random_crop = style_random_crop
 
         self.print_dir = self.data_root / "print"
         if not self.print_dir.exists():
@@ -186,7 +196,6 @@ class HandwrittenFormulaDataset(Dataset):
             final_buckets[target].extend(indices)
 
         if not final_buckets:
-            # 全部太小：各自独立成 batch_size=1 的桶
             final_buckets = {k: list(v) for k, v in size_to_indices.items()}
 
         return final_buckets
@@ -225,14 +234,15 @@ class HandwrittenFormulaDataset(Dataset):
             tensor = fit_transform_pil(img, bucket[0], bucket[1])
         return tensor
 
-    def _load_style_image(self, path: Path) -> Union[str, torch.Tensor]:
-        if self.style_as_tensor:
-            with Image.open(path) as img:
-                img = img.convert("RGB")
-            import torchvision.transforms as T
-            tensor = T.ToTensor()(img) * 2.0 - 1.0
-            return tensor
-        return str(path)
+    def _load_style_image(self, path: Path) -> torch.Tensor:
+        with Image.open(path) as img:
+            tensor, _ = preprocess_style_image(
+                img,
+                image_height=self.style_image_height,
+                max_width=self.style_max_width,
+                random_crop=self.style_random_crop,
+            )
+        return tensor
 
     def _get_single(self, idx: int):
         """获取单个样本。"""
@@ -279,10 +289,14 @@ class HandwrittenFormulaDataset(Dataset):
 
 
 def bucket_collate(batch):
+    """同 batch 内 I_p/I_t 尺寸相同，I_s 需要按 W 方向 padding。"""
     I_p = torch.stack([b[0] for b in batch], dim=0)
     I_t = torch.stack([b[2] for b in batch], dim=0)
     buckets = torch.tensor([list(b[3]) for b in batch], dtype=torch.long)
-    I_s = [b[1] for b in batch]
+
+    # 新版风格图：按高度 H 一致但宽度不同，右侧 padding + valid_mask
+    style_tensors = [b[1] for b in batch]
+    I_s, I_s_mask = batch_style_images(style_tensors, fill_value=1.0)
 
     caption_ids = [b[4] for b in batch]
     max_len = max((len(c) for c in caption_ids), default=0)
@@ -298,7 +312,7 @@ def bucket_collate(batch):
         else:
             mask[i, 0] = False
 
-    return I_p, I_s, I_t, buckets, padded, mask
+    return I_p, (I_s, I_s_mask), I_t, buckets, padded, mask
 
 
 # ── 动态 batch Sampler ──────────────────────────────────────────────
@@ -329,7 +343,6 @@ class FitDistributedSampler:
 
     def __iter__(self):
         batches = self.dataset.build_batches(self.epoch)
-        # build_batches 已按 batch_size / drop_last 处理好，直接 DDP 分片
         if not batches:
             raise RuntimeError(
                 f"FitDistributedSampler rank={self.rank}: no batches generated. "
@@ -351,7 +364,3 @@ class FitDistributedSampler:
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
-
-
-
-

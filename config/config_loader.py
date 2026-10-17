@@ -36,6 +36,13 @@ class StyleEncoderConfig:
     model_name: str = "openai/clip-vit-base-patch32"
     feature_dim: int = 768
     num_style_images: int = 3
+    use_convnext: bool = True
+    image_height: int = 64
+    max_width: int = 512
+    pretrained: bool = True
+    fg_threshold: float = 0.0
+    num_heads: int = 12
+    dropout: float = 0.0
 
 
 @dataclass
@@ -112,6 +119,10 @@ class DataConfig:
     repeats_per_image: int = 3
     styles_per_repeat: int = 3
     num_workers: int = 4
+    # 新版 ConvNeXt 风格编码器数据参数
+    style_image_height: int = 64
+    style_max_width: int = 512
+    style_random_crop: bool = True
 
 
 @dataclass

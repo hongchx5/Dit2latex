@@ -128,3 +128,78 @@ def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
         tensor = denormalize(tensor)
     arr = (tensor * 255).byte().permute(1, 2, 0).cpu().numpy()
     return Image.fromarray(arr)
+
+
+# ── 新版风格图：整图固定高度 + 动态宽度预处理 ─────────────────────────
+
+
+def preprocess_style_image(
+    image: Image.Image,
+    image_height: int = 64,
+    max_width: int = 512,
+    random_crop: bool = False,
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """
+    风格图预处理：等比缩放到固定高度，宽度动态；超出 max_width 时裁剪。
+
+    Args:
+        image: PIL Image（任意模式）。
+        image_height: 目标高度 H。
+        max_width: 最大允许宽度。
+        random_crop: 是否随机裁剪一段（训练用）；False 为中心裁剪（推理用）。
+
+    Returns:
+        tensor: (3, H, W)，归一化到 [-1, 1]，白底 +1.0。
+        original_size: (W, H) 缩放后的原始尺寸（裁剪前）。
+    """
+    import random
+    img = image.convert("RGB")
+    w, h = img.size
+    scale = image_height / h
+    new_w = max(1, int(round(w * scale)))
+    new_h = image_height
+    resized = img.resize((new_w, new_h), Image.BICUBIC)
+
+    if new_w > max_width:
+        if random_crop:
+            start = random.randint(0, new_w - max_width)
+        else:
+            start = (new_w - max_width) // 2
+        resized = resized.crop((start, 0, start + max_width, new_h))
+        new_w = max_width
+
+    tensor = T.ToTensor()(resized) * 2.0 - 1.0  # (3, H, W), ∈ [-1, 1]
+    return tensor, (new_w, new_h)
+
+
+def batch_style_images(
+    tensors: List[torch.Tensor],
+    fill_value: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    把高度相同、宽度不同的风格图 tensor batch 在一起，右侧 padding。
+
+    Args:
+        tensors: [(3, H, W_i)]，均已归一化到 [-1, 1]。
+        fill_value: padding 填充值，必须用背景色 +1.0（白）。
+
+    Returns:
+        batched: (B, 3, H, W_max)
+        valid_mask: (B, W_max) bool，True 表示真实图像区域。
+    """
+    if not tensors:
+        raise ValueError("empty tensor list")
+    H = tensors[0].shape[1]
+    assert all(t.shape[1] == H for t in tensors), "all style tensors must have the same height"
+    max_w = max(t.shape[2] for t in tensors)
+    B = len(tensors)
+
+    batched = torch.full((B, 3, H, max_w), fill_value, dtype=tensors[0].dtype)
+    valid_mask = torch.zeros((B, max_w), dtype=torch.bool)
+
+    for i, t in enumerate(tensors):
+        w = t.shape[2]
+        batched[i, :, :, :w] = t
+        valid_mask[i, :w] = True
+
+    return batched, valid_mask

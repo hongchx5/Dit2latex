@@ -111,6 +111,8 @@ class Trainer:
 
             for batch in train_loader:
                 I_p, I_s, I_t, buckets, caption_ids, caption_mask = batch
+                # I_s is a tuple (style_tensor, valid_mask)
+                I_s = (I_s[0].to(self.device), I_s[1].to(self.device))
 
                 I_p = I_p.to(self.device)
                 I_t = I_t.to(self.device)
@@ -232,6 +234,7 @@ class Trainer:
         num_batches = 0
         with torch.no_grad():
             for I_p, I_s, I_t, buckets, caption_ids, caption_mask in val_loader:
+                I_s = (I_s[0].to(self.device), I_s[1].to(self.device))
                 I_p = I_p.to(self.device)
                 I_t = I_t.to(self.device)
                 caption_ids = caption_ids.to(self.device)

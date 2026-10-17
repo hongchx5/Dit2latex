@@ -1,11 +1,4 @@
-"""推理器：FiT 可变分辨率风格条件生成。
-
-流程：
-1. 内容图按 FiT patch 预算动态缩放；
-2. 风格图走平铺切分 → CLIP → 4-query 聚合；
-3. DiT 在动态 latent 上做 DDIM 采样；
-4. 可选 --restore_size 还原到原始像素尺寸。
-"""
+"""推理器：FiT 可变分辨率风格条件生成。"""
 
 from __future__ import annotations
 
@@ -22,7 +15,7 @@ from models.pipeline import DiTtolatexPipeline
 from models.caption_encoder import build_vocab, encode_caption_string
 from diffusion.ddim import ddim_sample
 from data.buckets import fit_size_to_patch_budget, bucket_transform_pil, bucket_transform_tensor
-from data.transforms import tensor_to_pil
+from data.transforms import preprocess_style_image, tensor_to_pil
 
 
 class Inferencer:
@@ -45,12 +38,6 @@ class Inferencer:
         print(f"Loaded weights from {path}")
 
     def _load_content(self, print_image: Union[str, Image.Image, torch.Tensor]):
-        """
-        内容图预处理：按 FiT patch 预算等比缩放。
-
-        Returns:
-            (I_p (1,3,H,W), original_size (H,W), fitted_size (H,W))
-        """
         if isinstance(print_image, torch.Tensor):
             tensor = print_image.to(self.device)
             if tensor.dim() == 3:
@@ -101,31 +88,28 @@ class Inferencer:
         caption: Optional[str] = None,
         restore_size: bool = False,
     ) -> Image.Image:
-        """
-        风格条件生成单张图像。
-
-        Args:
-            print_image: 打印体公式图像。
-            style_image: 手写风格参考图像。
-            output_path: 可选保存路径。
-            caption: 可选 latex 公式字符串。
-            restore_size: 是否将输出还原到原始 print 图像尺寸。
-
-        Returns:
-            PIL Image。
-        """
-        # 1. 内容图缩放
+        """风格条件生成单张图像。"""
         I_p, original_size, fitted_size = self._load_content(print_image)
         fh, fw = fitted_size
         print(f"[Diag] print {original_size[0]}x{original_size[1]} -> {fh}x{fw}")
 
-        # 2. 风格编码
-        f_s_seq, f_s_pooled = self.pipeline.encode_style(style_image)
+        # 新版风格编码：整图输入 + valid_mask
+        if isinstance(style_image, str):
+            style_pil = Image.open(style_image)
+        else:
+            style_pil = style_image
+        style_tensor, _ = preprocess_style_image(
+            style_pil.convert("RGB"),
+            image_height=self.config.data.style_image_height,
+            max_width=self.config.data.style_max_width,
+            random_crop=False,
+        )
+        style_tensor = style_tensor.unsqueeze(0).to(self.device)
+        style_mask = torch.ones(1, style_tensor.shape[-1], dtype=torch.bool, device=self.device)
+        f_s_seq, f_s_pooled = self.pipeline.encode_style((style_tensor, style_mask))
 
-        # 3. caption
         caption_seq, caption_mask = self._make_caption(caption)
 
-        # 4. 初始噪声
         latent_h = fh // self.vae_f
         latent_w = fw // self.vae_f
         z_T = torch.randn(
@@ -133,10 +117,8 @@ class Inferencer:
             device=self.device,
         )
 
-        # 5. 内容条件 latent
         z_p = self.pipeline.encode_content(I_p)
 
-        # 6. DDIM 采样
         z_0 = ddim_sample(
             pipeline=self.pipeline,
             noise_schedule=self.pipeline.noise_schedule,
@@ -151,12 +133,10 @@ class Inferencer:
             cfg_scale=self.config.diffusion.cfg_scale,
         )
 
-        # 7. 解码
         I_g = self.pipeline.decode_latent(z_0)
         I_g = I_g.squeeze(0).cpu()
-        pil_img = tensor_to_pil(I_g)  # (fh, fw)
+        pil_img = tensor_to_pil(I_g)
 
-        # 8. 可选还原尺寸
         if restore_size:
             orig_h, orig_w = original_size
             pil_img = pil_img.resize((orig_w, orig_h), Image.BICUBIC)

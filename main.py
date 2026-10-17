@@ -59,6 +59,13 @@ def build_pipeline(config: Config) -> DiTtolatexPipeline:
         stride=config.data.tile_stride,
         cache_dir=config.data.style_cache_dir,
         device=device,
+        use_convnext=config.model.style_encoder.use_convnext,
+        image_height=config.model.style_encoder.image_height,
+        max_width=config.model.style_encoder.max_width,
+        pretrained=config.model.style_encoder.pretrained,
+        fg_threshold=config.model.style_encoder.fg_threshold,
+        num_heads=config.model.style_encoder.num_heads,
+        dropout=config.model.style_encoder.dropout,
     )
 
     dit = DiT(
@@ -156,6 +163,9 @@ def _build_train_dataset(config: Config) -> HandwrittenFormulaDataset:
         caption_path=config.data.caption_path,
         dictionary_path=config.data.dictionary_path,
         use_caption=config.model.caption.enabled,
+        style_image_height=config.data.style_image_height,
+        style_max_width=config.data.style_max_width,
+        style_random_crop=config.data.style_random_crop,
     )
 
 

@@ -79,6 +79,10 @@ data:
   repeats_per_image: 3         # 每张图重复几轮
   styles_per_repeat: 3         # 每轮选几张风格参考图
   num_workers: 4
+  # 新版 ConvNeXt 风格编码器数据参数
+  style_image_height: 64       # 风格图固定高度 H
+  style_max_width: 512         # 风格图最大宽度（超出训练随机裁剪 / 推理居中裁剪）
+  style_random_crop: true      # 训练时超出宽度是否随机裁剪
 
 mode:
   offline_test: false   # true 时用简单层替换所有预训练模块
