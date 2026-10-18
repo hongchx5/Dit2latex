@@ -8,7 +8,7 @@ model:
     num_heads: 12
     depth: 12
     mlp_ratio: 4.0
-    patch_size: 2
+    patch_size: 4
     in_channels: 8       # z_t' = [z_t; z_p] 拼接后的通道数
     out_channels: 8      # 输出去噪后的 8 通道，取前 4 通道作为噪声预测
     latent_dim: 4        # VAE 潜在空间通道数
@@ -34,7 +34,7 @@ model:
 
 training:
   total_steps: 450000
-  batch_size: 4          # 每步的 (I_p, I_s 组, I_t) 三元组数；FiT 下这是每个动态桶内的 batch_size
+  # batch_size: 4          # 每步的 (I_p, I_s 组, I_t) 三元组数；FiT 下这是每个动态桶内的 batch_size
   lr: 2.0e-5
   weight_decay: 1.0e-4
   warmup_steps: 2000
@@ -64,7 +64,7 @@ data:
   data_root: "./data"
   image_size: 256              # 旧版正方形边长（兼容保留，分桶模式下不使用）
   fit:
-    max_patch: 192            # 单张图 patch token 总数上限
+    max_patch: 256            # 单张图 patch token 总数上限
     # 下面三个字段由 model.vae.f 与 model.dit.patch_size 自动推导，
     # 这里写的值仅作默认展示，加载配置时会被覆盖：
     #   patch_size        = vae.f * dit.patch_size
@@ -94,8 +94,8 @@ mode:
   device: "cuda:1"         # "cuda", "cpu"
 
 distributed:
-  enabled: false      # true 时启用多卡 DDP 训练（自动按下方 gpus 列表 spawn 多进程）
-  gpus: ["cuda:0"]   # 参与训练的 GPU 列表（每个 GPU 一个训练进程）
+  enabled: true      # true 时启用多卡 DDP 训练（自动按下方 gpus 列表 spawn 多进程）
+  gpus: ["cuda:0","cuda:1"]   # 参与训练的 GPU 列表（每个 GPU 一个训练进程）
   backend: "nccl"       # 分布式后端（单机多卡用 nccl）
 
 
