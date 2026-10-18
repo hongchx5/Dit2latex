@@ -11,3 +11,4 @@ _diag/
 .workbuddy/
 训练NaN排查报告.md
 preview_output/
+data/test/
