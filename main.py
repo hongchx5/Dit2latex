@@ -118,7 +118,7 @@ def _make_exp_dir(base_log_dir: str, config_path: Optional[str] = None) -> str:
     ids = [
         int(m.group(1))
         for d in os.listdir(base_log_dir)
-        if (m := re.fullmatch(r"exp_(d+)", d)) and os.path.isdir(os.path.join(base_log_dir, d))
+        if (m := re.fullmatch(r"exp_(\d+)", d)) and os.path.isdir(os.path.join(base_log_dir, d))
     ]
     exp_id = max(ids, default=0) + 1
     exp_dir = os.path.join(base_log_dir, f"exp_{exp_id:04d}")
@@ -344,6 +344,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
