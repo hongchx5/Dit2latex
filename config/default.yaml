@@ -13,6 +13,9 @@ model:
     out_channels: 8      # 输出去噪后的 8 通道，取前 4 通道作为噪声预测
     latent_dim: 4        # VAE 潜在空间通道数
     use_grid_cond: false # 是否在 AdaLN 中注入当前 grid_h/grid_w 条件
+    local_enhance:       # VAE 编码后、进入 DiT patch 前的轻量残差局部增强
+      enabled: true      # 关闭时完全不创建参数，等价于原模型
+      kernel_size: 3     # 深度卷积核大小；奇数，3 表示 3x3
 
   vae:
     pretrained_path: "/home/user/data3/daxger9/HMER/FiT/pretrained/stabilityai/sd-vae-ft-ema"
@@ -62,9 +65,14 @@ data:
   image_size: 256              # 旧版正方形边长（兼容保留，分桶模式下不使用）
   fit:
     max_patch: 192            # 单张图 patch token 总数上限
-    patch_size: 16              # 像素级 patch 尺寸（content 图 16x16 = 1 patch）
-    latent_patch_size: 2        # DiT latent 空间 patch 尺寸
-    multiple: 16                # 尺寸对齐粒度（同时满足 VAE 8 倍 + DiT patch 2 倍）
+    # 下面三个字段由 model.vae.f 与 model.dit.patch_size 自动推导，
+    # 这里写的值仅作默认展示，加载配置时会被覆盖：
+    #   patch_size        = vae.f * dit.patch_size
+    #   latent_patch_size = dit.patch_size
+    #   multiple          = vae.f * dit.patch_size
+    patch_size: 16
+    latent_patch_size: 2
+    multiple: 16
     min_height: 64             # 缩放后高度低于此值的图丢弃
     batch_size: 4              # 每个动态桶的 batch 大小
     drop_last: true            # 桶内尾部不足一个 batch 时是否丢弃
@@ -89,4 +97,6 @@ distributed:
   enabled: false      # true 时启用多卡 DDP 训练（自动按下方 gpus 列表 spawn 多进程）
   gpus: ["cuda:0"]   # 参与训练的 GPU 列表（每个 GPU 一个训练进程）
   backend: "nccl"       # 分布式后端（单机多卡用 nccl）
+
+
 

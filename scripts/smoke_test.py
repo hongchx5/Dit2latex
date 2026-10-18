@@ -36,7 +36,7 @@ class FakePerceptual(torch.nn.Module):
         return F.mse_loss(x, y)
 
 
-def _build_pipe(use_caption):
+def _build_pipe(use_caption, use_local_enhance=False, local_enhance_kernel=3):
     from models.vae import OfflineVAE
     from models.style_encoder import OfflineStyleEncoder
     from models.caption_encoder import CaptionEncoder
@@ -50,7 +50,9 @@ def _build_pipe(use_caption):
     style_enc = OfflineStyleEncoder(feature_dim=H).to(DEV)
     cap_enc = CaptionEncoder(vocab_size=112, hidden_dim=H, max_len=256, num_layers=1, num_heads=heads).to(DEV) if use_caption else None
     dit = DiT(hidden_dim=H, num_heads=heads, depth=3, patch_size=2, in_channels=8, out_channels=8,
-              latent_dim=4, context_dim=H, use_caption=use_caption).to(DEV)
+              latent_dim=4, context_dim=H, use_caption=use_caption,
+              local_enhance=use_local_enhance,
+              local_enhance_kernel=local_enhance_kernel).to(DEV)
     ns = NoiseSchedule(num_timesteps=100, beta_schedule="cosine", device=DEV)
     pipe = DiTtolatexPipeline(
         vae=vae, style_encoder=style_enc, caption_encoder=cap_enc, dit=dit,
@@ -200,12 +202,59 @@ def test_caption_off():
     print("[3] caption OFF: DDIM OK")
 
 
+def test_local_enhance():
+    """验证局部增强模块开启/关闭两种路径。"""
+    from models.dit.dit import DiT
+
+    H, heads = 192, 3
+
+    # 关闭：不应创建任何增强参数
+    dit_off = DiT(hidden_dim=H, num_heads=heads, depth=2, patch_size=2, in_channels=8,
+                  out_channels=8, latent_dim=4, context_dim=H, use_caption=False,
+                  local_enhance=False).to(DEV)
+    assert dit_off.patch_embed.local_enhance is None
+    off_keys = [k for k in dit_off.state_dict().keys() if "local_enhance" in k]
+    assert len(off_keys) == 0, f"disabled enhance should have no params, got {off_keys}"
+
+    # 开启：应有 depthwise + pointwise 参数
+    dit_on = DiT(hidden_dim=H, num_heads=heads, depth=2, patch_size=2, in_channels=8,
+                 out_channels=8, latent_dim=4, context_dim=H, use_caption=False,
+                 local_enhance=True, local_enhance_kernel=3).to(DEV)
+    assert dit_on.patch_embed.local_enhance is not None
+    on_keys = [k for k in dit_on.state_dict().keys() if "local_enhance" in k]
+    assert any("depthwise.weight" in k for k in on_keys)
+    assert any("pointwise.weight" in k for k in on_keys)
+    assert dit_on.patch_embed.local_enhance.depthwise.kernel_size == (3, 3)
+
+    B = 2
+    z = torch.randn(B, 8, 16, 32, device=DEV)
+    f_seq = torch.randn(B, 4, H, device=DEV)
+    f_pooled = torch.randn(B, H, device=DEV)
+    t = torch.randint(0, 100, (B,), device=DEV)
+
+    out_off = dit_off(z, f_seq, f_pooled, None, None, t)
+    out_on = dit_on(z, f_seq, f_pooled, None, None, t)
+    assert out_off.shape == (B, 4, 16, 32)
+    assert out_on.shape == (B, 4, 16, 32)
+
+    # 首次前向：pointwise 零初始化，局部增强应等价于原输入
+    with torch.no_grad():
+        enhanced = dit_on.patch_embed.local_enhance(z)
+    assert torch.allclose(enhanced, z, atol=1e-6), "zero-init enhance should be identity at start"
+
+    out_on.mean().backward()
+    assert dit_on.patch_embed.local_enhance.depthwise.weight.grad is not None
+    print("[4] local enhance: disabled/identity/forward/backward OK")
+
+
 def main():
     test_fit_bucket()
     test_caption_on()
     test_caption_off()
+    test_local_enhance()
     print("\nALL FIT + CAPTION-SWITCH SMOKE TESTS PASSED")
 
 
 if __name__ == "__main__":
     main()
+

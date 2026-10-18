@@ -72,6 +72,8 @@ def build_pipeline(config: Config) -> DiTtolatexPipeline:
         latent_dim=config.model.dit.latent_dim,
         context_dim=config.model.style_encoder.feature_dim,
         use_caption=config.model.caption.enabled,
+        local_enhance=config.model.dit.local_enhance.enabled,
+        local_enhance_kernel=config.model.dit.local_enhance.kernel_size,
     ).to(device)
 
     caption_enc = None
@@ -342,5 +344,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 

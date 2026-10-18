@@ -73,6 +73,8 @@ class DiT(nn.Module):
         caption_dim: Optional[int] = None,
         dropout: float = 0.0,
         use_caption: bool = True,
+        local_enhance: bool = False,
+        local_enhance_kernel: int = 3,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -84,10 +86,14 @@ class DiT(nn.Module):
             caption_dim = hidden_dim
 
         # Patch embedding（动态 grid，分辨率由输入决定）
+        self.local_enhance_enabled = bool(local_enhance)
+        self.local_enhance_kernel = int(local_enhance_kernel)
         self.patch_embed = PatchEmbed(
             patch_size=patch_size,
             in_channels=in_channels,
             hidden_dim=hidden_dim,
+            local_enhance=self.local_enhance_enabled,
+            local_enhance_kernel=self.local_enhance_kernel,
         )
 
         # 时间嵌入
@@ -215,3 +221,5 @@ class DiT(nn.Module):
 
         # 取前 latent_dim（4）通道作为噪声预测
         return out[:, :self.latent_dim]
+
+

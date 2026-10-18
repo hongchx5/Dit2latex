@@ -1,4 +1,8 @@
-"""配置加载器：从 YAML 解析为结构化 dataclass，提供单例访问。"""
+"""配置加载器：从 YAML 解析为结构化 dataclass，提供单例访问。
+
+注意：data.fit 中的 patch_size / latent_patch_size / multiple 由
+model.vae.f 与 model.dit.patch_size 自动推导，无需在 YAML 中手改。
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,13 @@ from typing import Optional, get_type_hints
 
 
 # ── 子配置 ──────────────────────────────────────────────────────────
+
+@dataclass
+class LocalEnhanceConfig:
+    """VAE 编码后、DiT patch 前的轻量残差局部特征增强。"""
+    enabled: bool = True          # 关闭时完全不创建参数，等价于原模型
+    kernel_size: int = 3          # 深度卷积核大小（3 = 3x3）
+
 
 @dataclass
 class DiTConfig:
@@ -22,6 +33,7 @@ class DiTConfig:
     out_channels: int = 8
     latent_dim: int = 4
     use_grid_cond: bool = False
+    local_enhance: LocalEnhanceConfig = field(default_factory=LocalEnhanceConfig)
 
 
 @dataclass
@@ -56,9 +68,10 @@ class ModelConfig:
 @dataclass
 class FitConfig:
     max_patch: int = 192
-    patch_size: int = 16
-    latent_patch_size: int = 2
-    multiple: int = 16
+    # 以下三个字段由 Config.__post_init__ 自动推导，YAML 中写什么都以推导值为准。
+    patch_size: int = 16          # = vae.f * dit.patch_size（内容图像素级 patch）
+    latent_patch_size: int = 2    # = dit.patch_size（DiT latent 级 patch）
+    multiple: int = 16            # = vae.f * dit.patch_size（保证 latent 能被 patch 整除）
     min_height: int = 64
     batch_size: int = 4
     drop_last: bool = True
@@ -137,6 +150,28 @@ class Config:
     mode: ModeConfig = field(default_factory=ModeConfig)
     distributed: DistributedConfig = field(default_factory=DistributedConfig)
 
+    def __post_init__(self):
+        """从 VAE 下采样倍率和 DiT patch 尺寸推导数据侧尺寸参数。
+
+        patch_size（内容图像素级 patch）= vae.f * dit.patch_size
+        latent_patch_size（latent 级 patch） = dit.patch_size
+        multiple（尺寸对齐粒度） = vae.f * dit.patch_size
+
+        这样修改 model.dit.patch_size 后，数据缩放会自动随之变化，
+        且 latent 的高宽一定能被 patch_size 整除。
+        """
+        vae_f = int(self.model.vae.f)
+        dit_patch = int(self.model.dit.patch_size)
+        if vae_f <= 0:
+            raise ValueError(f"model.vae.f must be positive, got {vae_f}")
+        if dit_patch <= 0:
+            raise ValueError(f"model.dit.patch_size must be positive, got {dit_patch}")
+
+        derived = vae_f * dit_patch
+        self.data.fit.patch_size = derived
+        self.data.fit.latent_patch_size = dit_patch
+        self.data.fit.multiple = derived
+
 
 # ── 加载函数 ────────────────────────────────────────────────────────
 
@@ -176,4 +211,3 @@ def set_config(cfg: Config) -> None:
     """设置全局配置单例。"""
     global _cfg
     _cfg = cfg
-
